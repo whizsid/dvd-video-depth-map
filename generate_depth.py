@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 # Reduce noisy shutdown leaks from tokenizers / OpenCV / torch workers.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -1279,6 +1280,8 @@ def generate_depth_from_video(
     keep_upsample_cache: bool = False,
     probe: tuple[float, int, int, int] | None = None,
     shot_ranges: tuple[tuple[int, int], ...] | None = None,
+    upsample_device: str = "cpu",
+    release_infer_model: Callable | None = None,
 ) -> tuple[np.ndarray | None, float, tuple[int, int], ParallelUpscaler | None]:
     """Windowed inference with optional prep|infer|post resource-aware pipeline.
 
@@ -1385,6 +1388,7 @@ def generate_depth_from_video(
             cache_dir=up_dir if run_upsample else None,
             keep_upsample_cache=keep_upsample_cache,
             bgr_store=bgr_store,
+            upsample_device=upsample_device,
         )
         return depth, fps, (orig_h, orig_w), upscaler
 
@@ -1427,6 +1431,12 @@ def generate_depth_from_video(
     if not run_upsample:
         return depth[None], fps, (orig_h, orig_w), None
 
+    # Free DiT/VAE before CUDA JBU so T4 VRAM is available for upsample.
+    if release_infer_model is not None:
+        print("Releasing infer model before upsample...", flush=True)
+        release_infer_model()
+        free_memory(device)
+
     if keep_upsample_cache:
         up_dir = up_cache_dir_for_video(
             cache_root,
@@ -1447,6 +1457,7 @@ def generate_depth_from_video(
         workers=plan0.upsample_workers,
         cache_dir=up_dir,
         keep_cache=keep_upsample_cache,
+        device=upsample_device,
     )
     upscaler.submit_range(depth[None], 0, total_frames)
     return None, fps, (orig_h, orig_w), upscaler

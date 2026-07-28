@@ -215,6 +215,7 @@ def run_window_pipeline(
     cache_dir: Path | None = None,
     keep_upsample_cache: bool = False,
     bgr_store=None,
+    upsample_device: str = "cpu",
 ) -> tuple[np.ndarray | None, ParallelUpscaler | None]:
     """
     Run windowed DVD inference.
@@ -245,6 +246,7 @@ def run_window_pipeline(
             workers=plan0.upsample_workers,
             cache_dir=cache_dir,
             keep_cache=keep_upsample_cache,
+            device=upsample_device,
         )
 
     if not pipeline_parallel or n_windows == 1:

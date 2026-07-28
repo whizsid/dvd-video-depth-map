@@ -300,7 +300,13 @@ def parse_args():
     parser.add_argument(
         "--upsample-workers",
         default="auto",
-        help="CPU threads for JBU upscale (auto|N)",
+        help="CPU threads for JBU upscale when --upsample-device cpu (auto|N)",
+    )
+    parser.add_argument(
+        "--upsample-device",
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Run joint-bilateral upsample on CUDA (default) or CPU",
     )
     parser.add_argument(
         "--keep-upsample-cache",
@@ -340,6 +346,13 @@ def main() -> None:
     os.chdir(REPO_ROOT)
 
     do_upsample = not args.no_upsample
+    if do_upsample and args.upsample_device == "cuda" and not args.no_pipeline_parallel:
+        # Overlapping DiT + CUDA JBU fights for T4 VRAM; finish infer then upsample.
+        args.no_pipeline_parallel = True
+        print(
+            "CUDA upsample: enabling --no-pipeline-parallel so DiT is freed before JBU.",
+            flush=True,
+        )
     pipeline_parallel = not args.no_pipeline_parallel
     cleanup_stale_up_caches(cache_root, keep_pid=os.getpid())
     cleanup_stale_up_caches(Path(args.output_dir), keep_pid=os.getpid())
@@ -379,10 +392,24 @@ def main() -> None:
     if do_upsample:
         upsample_params = default_upsample_params(out_h, out_w, orig_h, orig_w)
         print(
-            f"JBU upsample: edge_radius={upsample_params.edge_radius} "
+            f"JBU upsample: device={args.upsample_device} "
+            f"edge_radius={upsample_params.edge_radius} "
             f"sigma_range={upsample_params.sigma_range}",
             flush=True,
         )
+
+    model_holder: list = [model]
+
+    def _release_infer_model() -> None:
+        m = model_holder[0]
+        model_holder[0] = None
+        if m is None:
+            return
+        try:
+            del m
+        except Exception:
+            pass
+        gd.free_memory(device)
 
     with torch.inference_mode():
         depth, origin_fps, orig_size, upscaler = gd.generate_depth_from_video(
@@ -403,10 +430,14 @@ def main() -> None:
             keep_upsample_cache=bool(args.keep_upsample_cache),
             probe=(fps_probe, total_probe, orig_h, orig_w),
             shot_ranges=shot_ranges,
+            upsample_device=args.upsample_device,
+            release_infer_model=_release_infer_model
+            if (do_upsample and not pipeline_parallel)
+            else None,
         )
         gd.free_memory(device)
 
-    del model
+    _release_infer_model()
     gd.free_memory(device)
 
     if upscaler is not None:

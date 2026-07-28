@@ -280,35 +280,158 @@ def joint_bilateral_upsample(
     return (acc / np.maximum(acc_w, 1e-8)).astype(np.float32)
 
 
+def joint_bilateral_upsample_cuda(
+    disp_low: np.ndarray,
+    guide_gray: np.ndarray,
+    radius: int,
+    sigma_range: float,
+    sigma_spatial: float | None = None,
+    *,
+    device: str = "cuda",
+) -> np.ndarray:
+    """Same JBU as ``joint_bilateral_upsample``, accumulated on CUDA."""
+    import torch
+    import torch.nn.functional as F
+
+    hi_h, hi_w = guide_gray.shape[:2]
+    lo_h, lo_w = disp_low.shape[:2]
+    if sigma_spatial is None:
+        sigma_spatial = max(1.0, float(radius))
+    inv_2ss = 1.0 / (2.0 * sigma_spatial * sigma_spatial)
+    inv_2sr = 1.0 / (2.0 * sigma_range * sigma_range)
+
+    dev = torch.device(device)
+    guide = torch.from_numpy(np.ascontiguousarray(guide_gray, dtype=np.float32)).to(
+        dev, non_blocking=True
+    )
+    disp = torch.from_numpy(np.ascontiguousarray(disp_low, dtype=np.float32)).to(
+        dev, non_blocking=True
+    )
+    # guide_low via area downsample
+    guide_b = guide.view(1, 1, hi_h, hi_w)
+    guide_low = F.interpolate(guide_b, size=(lo_h, lo_w), mode="area").view(lo_h, lo_w)
+    disp_b = disp.view(1, 1, lo_h, lo_w)
+
+    acc = torch.zeros((hi_h, hi_w), device=dev, dtype=torch.float32)
+    acc_w = torch.zeros((hi_h, hi_w), device=dev, dtype=torch.float32)
+
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            d_shift = torch.roll(disp, shifts=(dy, dx), dims=(0, 1)).view(1, 1, lo_h, lo_w)
+            g_shift = torch.roll(guide_low, shifts=(dy, dx), dims=(0, 1)).view(1, 1, lo_h, lo_w)
+            d_up = F.interpolate(d_shift, size=(hi_h, hi_w), mode="nearest").view(hi_h, hi_w)
+            g_up = F.interpolate(g_shift, size=(hi_h, hi_w), mode="nearest").view(hi_h, hi_w)
+            w_spatial = math.exp(-(dx * dx + dy * dy) * inv_2ss)
+            diff = guide - g_up
+            w = w_spatial * torch.exp(-(diff * diff) * inv_2sr)
+            acc = acc + w * d_up
+            acc_w = acc_w + w
+
+    out = acc / torch.clamp(acc_w, min=1e-8)
+    return out.detach().float().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _depth_edge_weight_cuda(depth: np.ndarray, feather: float, *, device: str = "cuda") -> np.ndarray:
+    import torch
+    import torch.nn.functional as F
+
+    dev = torch.device(device)
+    d = torch.from_numpy(np.ascontiguousarray(depth, dtype=np.float32)).to(dev)
+    # Sobel via conv2d
+    kx = torch.tensor(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=dev
+    ).view(1, 1, 3, 3)
+    ky = torch.tensor(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=dev
+    ).view(1, 1, 3, 3)
+    x = d.view(1, 1, *d.shape)
+    gx = F.conv2d(x, kx, padding=1)
+    gy = F.conv2d(x, ky, padding=1)
+    mag = torch.sqrt(gx * gx + gy * gy).view(*d.shape)
+    finite = torch.isfinite(d)
+    if int(finite.sum().item()) < 64:
+        return np.zeros(depth.shape, dtype=np.float32)
+    vals = d[finite]
+    # percentile via sort (small enough at infer res)
+    sorted_v, _ = torch.sort(vals.reshape(-1))
+    n = sorted_v.numel()
+    lo = sorted_v[max(0, int(0.02 * (n - 1)))]
+    hi = sorted_v[min(n - 1, int(0.98 * (n - 1)))]
+    scale = float((hi - lo).item())
+    if scale <= 1e-6:
+        return np.zeros(depth.shape, dtype=np.float32)
+    w = torch.clamp(mag / (0.5 * scale), 0.0, 1.0)
+    w = w * w * (3.0 - 2.0 * w)
+    if feather > 0:
+        # approx Gaussian blur with repeated box / F.conv gaussian
+        sigma = float(feather)
+        k = max(3, int(round(sigma * 6)) | 1)
+        half = k // 2
+        xs = torch.arange(k, device=dev, dtype=torch.float32) - half
+        ker = torch.exp(-(xs * xs) / (2.0 * sigma * sigma))
+        ker = ker / ker.sum()
+        kx1 = ker.view(1, 1, 1, k)
+        ky1 = ker.view(1, 1, k, 1)
+        wb = w.view(1, 1, *w.shape)
+        wb = F.conv2d(F.pad(wb, (half, half, 0, 0), mode="reflect"), kx1)
+        wb = F.conv2d(F.pad(wb, (0, 0, half, half), mode="reflect"), ky1)
+        w = wb.view(*w.shape)
+    return w.detach().float().cpu().numpy().astype(np.float32, copy=False)
+
+
 def sharp_upsample(
     disp_low: np.ndarray,
     guide_gray: np.ndarray,
     out_size: tuple[int, int],
     params: UpsampleParams,
+    *,
+    device: str = "cpu",
 ) -> np.ndarray:
     """
     Lanczos base in flats + full JBU at depth discontinuities.
 
     ``guide_gray`` must be full-res float32 in [0, 1] (RGB luminance).
     ``out_size`` is (width, height).
+    ``device``: ``\"cpu\"`` (OpenCV/NumPy) or ``\"cuda\"`` (Torch JBU on GPU).
     """
     out_w, out_h = out_size
     if guide_gray.shape[:2] != (out_h, out_w):
         guide_gray = cv2.resize(guide_gray, (out_w, out_h), interpolation=cv2.INTER_AREA)
     guide_gray = np.clip(guide_gray.astype(np.float32), 0.0, 1.0)
 
+    # Lanczos base stays on CPU (cheap vs JBU); bicubic fallback if needed.
     base = cv2.resize(disp_low, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4).astype(
         np.float32
     )
     jbu_radius = max(1, int(round(params.edge_radius / 2.0)))
-    jbu = joint_bilateral_upsample(
-        disp_low,
-        guide_gray,
-        radius=jbu_radius,
-        sigma_range=params.sigma_range,
-    )
+    use_cuda = str(device).startswith("cuda")
+    if use_cuda:
+        try:
+            import torch
 
-    dw_low = _depth_edge_weight(disp_low, feather=1.0)
+            if not torch.cuda.is_available():
+                use_cuda = False
+        except Exception:
+            use_cuda = False
+
+    if use_cuda:
+        jbu = joint_bilateral_upsample_cuda(
+            disp_low,
+            guide_gray,
+            radius=jbu_radius,
+            sigma_range=params.sigma_range,
+            device=device,
+        )
+        dw_low = _depth_edge_weight_cuda(disp_low, feather=1.0, device=device)
+    else:
+        jbu = joint_bilateral_upsample(
+            disp_low,
+            guide_gray,
+            radius=jbu_radius,
+            sigma_range=params.sigma_range,
+        )
+        dw_low = _depth_edge_weight(disp_low, feather=1.0)
+
     dw = cv2.resize(dw_low, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
     if params.depth_gate > 0:
         gate = (1.0 - params.depth_gate) + params.depth_gate * dw
@@ -430,18 +553,11 @@ def _meta_matches(existing: dict, expected: dict) -> bool:
 
 class ParallelUpscaler:
     """
-    Upscale finalized depth frames on CPU while DVD runs the next window on MPS/CPU.
+    Upscale finalized depth frames while DVD runs the next window.
 
     Jobs are submitted in frame order. A coordinator thread reads RGB guides and
-    dispatches JBU work to a thread pool so DiT inference and upscaling overlap.
-    Completed frames are written into float16 memmap file(s) (not per-frame
-    ``.npy`` files) to cut disk use and avoid mid-run ENOSPC failures. On FAT32
-    the store is automatically split under the 4 GiB file-size limit.
-
-    With ``keep_cache=True``, the memmap lives under a stable video-keyed directory
-    and is reused on later runs (skips multi-minute FAT32 re-allocation).
-
-    ``set_workers`` adjusts live concurrency (pool is sized to CPU count).
+    dispatches JBU work to a thread pool (CPU) or a single CUDA worker.
+    Completed frames are written into float16 memmap file(s).
     """
 
     def __init__(
@@ -455,6 +571,7 @@ class ParallelUpscaler:
         max_inflight: int | None = None,
         cache_dir: str | Path | None = None,
         keep_cache: bool = False,
+        device: str = "cpu",
     ):
         if total_frames <= 0:
             raise ValueError("total_frames must be > 0")
@@ -463,17 +580,28 @@ class ParallelUpscaler:
         self.params = params
         self.total_frames = int(total_frames)
         self.keep_cache = bool(keep_cache)
+        self.device = str(device or "cpu")
         self._lock = threading.Lock()
-        self.workers = max(1, int(workers))
-        self.max_inflight = max_inflight or max(2, self.workers * 2)
-        # Pool sized to the CPU soft-cap so JBU cannot saturate every core.
-        try:
-            from resources import max_cpu_threads
+        # CUDA JBU is serialized on one GPU — extra CPU workers fight for VRAM copies.
+        if self.device.startswith("cuda"):
+            self.workers = 1
+            self.max_inflight = 1
+            self._pool_size = 1
+            print(
+                f"Upsample device: {self.device} (JBU on GPU, 1 worker)",
+                flush=True,
+            )
+        else:
+            self.workers = max(1, int(workers))
+            self.max_inflight = max_inflight or max(2, self.workers * 2)
+            try:
+                from resources import max_cpu_threads
 
-            pool_cap = max_cpu_threads()
-        except Exception:
-            pool_cap = os.cpu_count() or 4
-        self._pool_size = max(self.workers, pool_cap)
+                pool_cap = max_cpu_threads()
+            except Exception:
+                pool_cap = os.cpu_count() or 4
+            self._pool_size = max(self.workers, pool_cap)
+            print(f"Upsample device: cpu (JBU threads={self.workers})", flush=True)
 
         expected_meta = _upsample_meta(
             self.video_path,
@@ -587,6 +715,8 @@ class ParallelUpscaler:
 
     def set_workers(self, workers: int, max_inflight: int | None = None) -> None:
         """Dynamically resize active JBU concurrency (governor-driven)."""
+        if self.device.startswith("cuda"):
+            return
         with self._lock:
             new_w = max(1, min(int(workers), self._pool_size))
             if new_w != self.workers:
@@ -822,6 +952,7 @@ class ParallelUpscaler:
                     self.params,
                     self._mm,
                     idx,
+                    self.device,
                 )
                 inflight[idx] = fut
 
@@ -892,7 +1023,8 @@ def _upsample_to_memmap(
     params: UpsampleParams,
     mm: FrameMemmapStore,
     idx: int,
+    device: str = "cpu",
 ) -> int:
-    up = sharp_upsample(disp_low, guide_gray, out_size, params)
+    up = sharp_upsample(disp_low, guide_gray, out_size, params, device=device)
     mm[idx] = up.astype(np.float16, copy=False)
     return idx
