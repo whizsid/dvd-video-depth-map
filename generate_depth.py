@@ -1506,6 +1506,11 @@ def stabilize_depth_video(
             continue
         print(f"[stabilize] shot {shot_idx + 1}/{len(ranges)} frames [{s0}:{s1})", flush=True)
         shot = [np.asarray(d, dtype=np.float32) for d in stabilized[s0:s1]]
+        print(
+            f"[stabilize] band-lock + Farneback temporal median on {s1 - s0} frames "
+            f"(CPU — can take several minutes on Colab; progress prints below)...",
+            flush=True,
+        )
         shot = apply_shot_band_lock(shot)
         shot = apply_flow_temporal_median(
             video_path,

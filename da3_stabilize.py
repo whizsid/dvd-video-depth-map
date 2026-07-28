@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -380,20 +381,28 @@ def apply_shot_band_lock(
         return disparities
     canons: np.ndarray | None = None
     out: list[np.ndarray] = []
-    for disp in disparities:
+    n = len(disparities)
+    t0 = time.perf_counter()
+    for i, disp in enumerate(disparities):
         arr = np.asarray(disp, dtype=np.float32)
         knots = _knot_values(arr, knot_pcts)
         if knots is None:
             out.append(arr.copy())
-            continue
-        if canons is None:
+        elif canons is None:
             canons = knots.copy()
             out.append(arr.copy())
-            continue
-        out.append(_piecewise_linear_map(arr, knots, canons))
-        if adapt > 0.0:
-            a = float(adapt)
-            canons = (1.0 - a) * canons + a * knots
+        else:
+            out.append(_piecewise_linear_map(arr, knots, canons))
+            if adapt > 0.0:
+                a = float(adapt)
+                canons = (1.0 - a) * canons + a * knots
+        done = i + 1
+        if done == 1 or done % 32 == 0 or done == n:
+            print(
+                f"  [stabilize] band-lock {done}/{n} "
+                f"({time.perf_counter() - t0:.1f}s)",
+                flush=True,
+            )
     return out
 
 
@@ -499,7 +508,9 @@ def compute_shot_flow(
 
     flow_fwd: list[np.ndarray] = []
     flow_bwd: list[np.ndarray] = []
-    for i in range(n - 1):
+    n_pairs = max(0, n - 1)
+    t0 = time.perf_counter()
+    for i in range(n_pairs):
         abs_i = int(abs_start) + i
         if pair_cache is not None and abs_i in pair_cache:
             f, b = pair_cache[abs_i]
@@ -519,6 +530,16 @@ def compute_shot_flow(
             pair_cache[abs_i] = (f, b)
         flow_fwd.append(f)
         flow_bwd.append(b)
+        done = i + 1
+        if done == 1 or done % 8 == 0 or done == n_pairs:
+            elapsed = time.perf_counter() - t0
+            rate = done / max(elapsed, 1e-3)
+            eta = (n_pairs - done) / max(rate, 1e-3)
+            print(
+                f"  [stabilize] Farneback pairs {done}/{n_pairs} "
+                f"({elapsed:.1f}s, ~{eta:.0f}s left)",
+                flush=True,
+            )
     return FlowGraph(process_h, process_w, flow_fwd, flow_bwd, grays)
 
 
@@ -730,12 +751,28 @@ def derive_stabilize_params(
     """Small DA3-inspired heuristic set for DVD post-stabilization."""
     long_side = max(process_w, process_h)
     flow_side = flow_long_side or min(long_side, 480)
+    # Colab ~12GiB hosts: Farneback at 480 on 600+ frames looks "hung" for many minutes.
+    low_host = False
+    try:
+        import psutil
+
+        low_host = psutil.virtual_memory().total <= int(14 * 1024**3)
+    except Exception:
+        pass
+    if os.environ.get("COLAB_GPU") or os.environ.get("COLAB_RELEASE_TAG"):
+        low_host = True
+    if low_host and flow_long_side is None:
+        flow_side = min(flow_side, 256)
     motion_radius = max(2, int(round(0.10 * fps)))
+    if low_host:
+        motion_radius = min(motion_radius, 2)
     chunk_frames = int(max(24, min(frame_count, 96)))
+    if low_host:
+        chunk_frames = int(max(24, min(frame_count, 48)))
     chunk_overlap = max(4, min(chunk_frames // 4, int(round(max(2.0, 0.25 * fps)))))
     return StabilizeParams(
         flow_long_side=flow_side,
-        farneback_levels=4 if max(process_w, process_h) >= 640 else 3,
+        farneback_levels=3 if low_host or max(process_w, process_h) < 640 else 4,
         farneback_winsize=max(11, int(round(21 * flow_side / 480.0)) | 1),
         temporal=TemporalMedianParams(
             enabled=True,
@@ -867,13 +904,31 @@ def _read_video_frames(
     if bgr_store is not None:
         try:
             return bgr_store.get_range(start, end)  # type: ignore[attr-defined]
-        except KeyError:
-            pass
+        except KeyError as exc:
+            print(
+                f"  [stabilize] bgr_store miss ({exc}); decoding from video "
+                f"[{start}:{end}) — slow on Drive mounts",
+                flush=True,
+            )
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video for stabilization: {video_path}")
     frames: list[np.ndarray] = []
-    idx = 0
+    # Prefer seek — linear skip from 0 is catastrophic for late chunks / Drive.
+    if start > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(start))
+        idx = start
+        # Some backends ignore seek; fall back to grab-skip if position is wrong.
+        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+        if abs(pos - start) > 2:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            idx = 0
+            while idx < start:
+                if not cap.grab():
+                    break
+                idx += 1
+    else:
+        idx = 0
     while idx < end:
         ok, frame = cap.read()
         if not ok:
@@ -912,7 +967,18 @@ def apply_flow_temporal_median(
     ranges = chunk_ranges(n, params.chunk_frames, params.chunk_overlap)
     half_overlap = params.chunk_overlap // 2
     pair_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    print(
+        f"  [stabilize] temporal median: {n} frames in {len(ranges)} chunks "
+        f"(chunk={params.chunk_frames}, flow_side={params.flow_long_side})",
+        flush=True,
+    )
     for chunk_idx, (s0, s1) in enumerate(ranges):
+        t_chunk = time.perf_counter()
+        print(
+            f"  [stabilize] chunk {chunk_idx + 1}/{len(ranges)} "
+            f"frames [{global_start + s0}:{global_start + s1})",
+            flush=True,
+        )
         frames_bgr = _read_video_frames(
             video_path,
             global_start + s0,
@@ -948,6 +1014,11 @@ def apply_flow_temporal_median(
                 bgr_store.release_before(drop_before)  # type: ignore[attr-defined]
             except Exception:
                 pass
+        print(
+            f"  [stabilize] chunk {chunk_idx + 1}/{len(ranges)} done "
+            f"({time.perf_counter() - t_chunk:.1f}s)",
+            flush=True,
+        )
     return [
         np.asarray(out[i], dtype=np.float32) if out[i] is not None else np.asarray(disparities[i], dtype=np.float32)
         for i in range(n)
