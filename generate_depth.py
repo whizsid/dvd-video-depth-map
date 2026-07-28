@@ -1654,8 +1654,16 @@ def main() -> None:
     # window must satisfy 4n+1 after padding helpers; 9 and 17 already do.
     model_config = args.model_config or (args.ckpt / "model_config.yaml")
     if not model_config.exists():
+        model_config = REPO_ROOT / "configs" / "model_config.yaml"
+    if not model_config.exists():
         model_config = DVD_ROOT / "ckpt" / "model_config.yaml"
+    if not model_config.exists():
+        raise FileNotFoundError(
+            "Missing model_config.yaml under ckpt/, configs/, or vendor/DVD/ckpt/. "
+            "Run: python scripts/download_weights.py"
+        )
     yaml_args = OmegaConf.load(str(model_config))
+    print(f"Model config: {model_config}", flush=True)
 
     cache_root = resolve_cache_root(args.cache_dir)
     os.environ.setdefault("HF_HOME", str(REPO_ROOT / ".cache" / "huggingface"))

@@ -1,0 +1,7 @@
+model_id_with_origin_paths: Wan-AI/Wan2.1-T2V-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-T2V-1.3B:Wan2.1_VAE.pth
+trainable_models: dit
+mode: regression
+denoise_step: 0.5
+training_target: x
+lora_base_model: dit
+lora_rank: 512

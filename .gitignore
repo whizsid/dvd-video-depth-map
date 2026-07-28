@@ -20,7 +20,9 @@ build/
 */.ipynb_checkpoints/
 
 # Model weights & HF downloads (large)
-ckpt/
+ckpt/*
+!ckpt/model_config.yaml
+!ckpt/.gitkeep
 models/
 vendor/DVD/ckpt/*.safetensors
 vendor/DVD/models/

@@ -52,6 +52,30 @@ def resolve_local_cache_root(explicit: Path | None) -> Path:
     return root
 
 
+def resolve_model_config(explicit: Path | None, ckpt_dir: Path) -> Path:
+    """Locate model_config.yaml (repo configs/, downloaded ckpt/, or vendor)."""
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(Path(explicit))
+    candidates.extend(
+        [
+            Path(ckpt_dir) / "model_config.yaml",
+            REPO_ROOT / "configs" / "model_config.yaml",
+            DVD_ROOT / "ckpt" / "model_config.yaml",
+        ]
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    checked = "\n  ".join(str(p) for p in candidates)
+    raise FileNotFoundError(
+        "Missing model_config.yaml. Checked:\n  "
+        f"{checked}\n"
+        "Run: python scripts/download_weights.py  (or pull the latest repo with "
+        "configs/model_config.yaml)."
+    )
+
+
 def cuda_device_info() -> str:
     if not torch.cuda.is_available():
         return "CUDA unavailable"
@@ -230,10 +254,9 @@ def main() -> None:
         "float32": torch.float32,
     }[args.dtype]
 
-    model_config = args.model_config or (args.ckpt / "model_config.yaml")
-    if not model_config.exists():
-        model_config = DVD_ROOT / "ckpt" / "model_config.yaml"
+    model_config = resolve_model_config(args.model_config, args.ckpt)
     yaml_args = OmegaConf.load(str(model_config))
+    print(f"Model config: {model_config}", flush=True)
 
     cache_root = resolve_local_cache_root(args.cache_dir)
     os.environ.setdefault("HF_HOME", str(REPO_ROOT / ".cache" / "huggingface"))
