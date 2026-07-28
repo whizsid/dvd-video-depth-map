@@ -13,10 +13,12 @@ except ImportError:  # optional
 
 
 # Leave a thin OS headroom on unified memory (Apple Silicon shares RAM/MPS).
+# Colab free tier is ~12–13 GiB system RAM — treat ≤14 GiB as low-mem (not only ≤9).
 RAM_HARD_FRAC = 0.95
+LOW_MEM_RAM_BYTES = int(14 * 1024**3)
 TARGET_LO = 0.85
 TARGET_HI = 0.93
-CRITICAL_FRAC = 0.95
+CRITICAL_FRAC = 0.92
 PRESSURE_TARGET = 0.90
 # Soft-cap system CPU so VAE / JBU leave headroom for the OS + decode threads.
 CPU_SOFT_CAP = 0.95
@@ -84,6 +86,13 @@ def available_ram_bytes() -> int:
         except Exception:
             pass
     return max(1, total_ram_bytes() // 2)
+
+
+def is_low_system_ram(total_bytes: int | None = None) -> bool:
+    """True for Colab-class hosts (~12–13 GiB) and smaller Macs."""
+    if total_bytes is None:
+        total_bytes = total_ram_bytes()
+    return int(total_bytes) <= LOW_MEM_RAM_BYTES
 
 
 def _cpu_frac() -> float:
@@ -175,10 +184,10 @@ class ResourceGovernor:
 
     def _max_prep_depth(self) -> int:
         total = total_ram_bytes()
-        # Prep is cheap (~0.3s/window); buffering many windows on 8GB steals RAM
-        # from VAE and causes swap thrash. Keep the queue shallow.
-        if total <= 9 * 1024**3:
-            return 2
+        # Prep is cheap (~0.3s/window); buffering many windows on Colab/8GB steals
+        # host RAM from VAE decode host copies and causes the Colab RAM killer.
+        if is_low_system_ram(total):
+            return 1
         return max(MAX_PREP_QUEUE_DEPTH, 8)
 
     def _initial_plan(self) -> ConcurrencyPlan:
@@ -188,6 +197,7 @@ class ResourceGovernor:
         budget = _usable_ram_budget(total)
         used = max(0, total - avail)
         headroom = max(1, budget - used)
+        low_mem = is_low_system_ram(total)
 
         ram_cap_up = max(1, int(headroom * 0.45) // self._fullres_frame_bytes())
         auto_up = max(1, min(cpu_cap, max(ram_cap_up, cpu_cap // 2)))
@@ -195,15 +205,15 @@ class ResourceGovernor:
         # More RAM → allow prep to buffer further ahead.
         ram_cap_prep = max(1, int(headroom * 0.20) // self._prep_window_bytes())
         prep_depth = max(1, min(self._max_prep_depth(), ram_cap_prep))
-        if total <= 9 * 1024**3:
-            prep_depth = min(prep_depth, 2)
+        if low_mem:
+            prep_depth = 1
             # Keep JBU quiet until post actually has frames; VAE needs the cores/RAM.
             auto_up = max(1, min(2, cpu_cap))
 
         return ConcurrencyPlan(
             upsample_workers=self._parse(self.upsample_arg, auto_up, cpu_cap),
             prep_queue_depth=max(1, prep_depth),
-            flow_prefetch_workers=1 if total <= 9 * 1024**3 else 2,
+            flow_prefetch_workers=1 if low_mem else 2,
             pause_prep=False,
             last_action="init",
         )
@@ -275,7 +285,7 @@ class ResourceGovernor:
         max_depth = self._max_prep_depth()
         up_auto = isinstance(self.upsample_arg, str) and self.upsample_arg.lower() == "auto"
         cpu_over = snap.cpu_frac >= CPU_SOFT_CAP
-        low_mem = snap.total_ram_bytes <= 9 * 1024**3
+        low_mem = is_low_system_ram(snap.total_ram_bytes)
         flow_cap = 1 if low_mem else 2
 
         if snap.ram_used_frac_of_budget >= CRITICAL_FRAC:

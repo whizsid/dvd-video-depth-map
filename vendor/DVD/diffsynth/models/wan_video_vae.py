@@ -808,7 +808,13 @@ class WanVideoVAE(nn.Module):
     def single_decode(self, hidden_state, device):
         hidden_state = hidden_state.to(device)
         video = self.model.decode(hidden_state, self.scale)
-        return video.clamp_(-1, 1)
+        video = video.clamp_(-1, 1)
+        # Drop decoder feature cache so host/GPU RAM does not retain slice state.
+        try:
+            self.model.clear_cache()
+        except Exception:
+            pass
+        return video
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
 

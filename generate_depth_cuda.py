@@ -91,6 +91,56 @@ def cuda_device_info() -> str:
     )
 
 
+def _is_colab() -> bool:
+    return bool(os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("COLAB_GPU"))
+
+
+def apply_low_host_ram_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Shrink windows / disable prep overlap on Colab-class ~12 GiB hosts.
+
+    Upstream defaults (480×640, window 81) keep DiT+VAE on the T4 fine, but
+    host-side prep queues + float32 VAE dumps exhaust Colab system RAM.
+    """
+    from resources import is_low_system_ram, total_ram_bytes
+
+    mem_gb = total_ram_bytes() / (1024**3)
+    low = is_low_system_ram() or _is_colab()
+
+    # Resolve None → profile defaults (explicit CLI values always win).
+    if low:
+        if args.height is None:
+            args.height = 320
+        if args.width is None:
+            args.width = 576
+        if args.window_size is None:
+            args.window_size = 17
+        if args.overlap is None:
+            args.overlap = 5
+        if not args.no_pipeline_parallel:
+            args.no_pipeline_parallel = True
+        if str(args.upsample_workers) == "auto":
+            args.upsample_workers = "1"
+        print(
+            f"Low host RAM profile ({mem_gb:.1f} GiB"
+            f"{', Colab' if _is_colab() else ''}): "
+            f"{args.height}x{args.width} window={args.window_size} "
+            f"overlap={args.overlap} sequential prep|infer. "
+            "Pass explicit flags to override.",
+            flush=True,
+        )
+    else:
+        if args.height is None:
+            args.height = 480
+        if args.width is None:
+            args.width = 640
+        if args.window_size is None:
+            args.window_size = 81
+        if args.overlap is None:
+            args.overlap = 21
+
+    return args
+
+
 def load_model_full_gpu(
     ckpt_dir: Path,
     yaml_args,
@@ -172,6 +222,12 @@ def load_model_full_gpu(
     model.pipe.device = device
     model.pipe.torch_dtype = dtype
     model.pipe.vram_management_enabled = False
+    # Drop any lingering host copies from load/cast/LoRA bake (Colab RAM killer).
+    import gc
+
+    gc.collect()
+    gd.free_memory(device)
+    gc.collect()
     gd.free_memory(device)
 
     model.eval()
@@ -209,26 +265,26 @@ def parse_args():
     parser.add_argument(
         "--height",
         type=int,
-        default=480,
-        help="Inference height (default: 480, upstream CUDA)",
+        default=None,
+        help="Inference height (default: 480, or 320 on Colab/≤14GiB RAM)",
     )
     parser.add_argument(
         "--width",
         type=int,
-        default=640,
-        help="Inference width (default: 640, upstream CUDA)",
+        default=None,
+        help="Inference width (default: 640, or 576 on Colab/≤14GiB RAM)",
     )
     parser.add_argument(
         "--window-size",
         type=int,
-        default=81,
-        help="Temporal window (default: 81, must be 4n+1)",
+        default=None,
+        help="Temporal window (default: 81, or 17 on Colab/≤14GiB RAM; must be 4n+1)",
     )
     parser.add_argument(
         "--overlap",
         type=int,
-        default=21,
-        help="Window overlap (default: 21)",
+        default=None,
+        help="Window overlap (default: 21, or 5 on Colab/≤14GiB RAM)",
     )
     parser.add_argument(
         "--max-frames",
@@ -261,6 +317,7 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
+    args = apply_low_host_ram_defaults(args)
 
     if not torch.cuda.is_available():
         raise RuntimeError(
