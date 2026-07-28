@@ -98,6 +98,26 @@ def load_model_full_gpu(
     dtype: torch.dtype,
 ):
     """Load DVD/Wan with DiT + VAE fully resident on ``device`` (no block swap)."""
+    # peft probes torchao and hard-raises on Colab's stock 0.10.x; DVD only needs LoRA.
+    try:
+        import importlib.metadata as importlib_metadata
+        import importlib.util
+
+        if importlib.util.find_spec("torchao") is not None:
+            ver = importlib_metadata.version("torchao")
+            from packaging.version import Version
+
+            if Version(ver) < Version("0.16.0"):
+                raise ImportError(
+                    f"Incompatible torchao {ver} (peft needs >=0.16). "
+                    "On Colab run: !pip uninstall -y torchao  then Restart session. "
+                    "DVD does not use torchao."
+                )
+    except ImportError:
+        raise
+    except Exception:
+        pass
+
     print("Initializing DVD / Wan backbone (CPU)...", flush=True)
     accelerator = Accelerator()
     model = WanTrainingModule(
