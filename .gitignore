@@ -1,0 +1,45 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+.cursor/
+.idea/
+.vscode/
+*.swp
+*~
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Model weights & HF downloads (large)
+ckpt/
+models/
+vendor/DVD/ckpt/*.safetensors
+vendor/DVD/models/
+
+# Outputs
+outputs/
+inference_results/
+*.mp4
+!vendor/DVD/demo/*.mp4
+outputs/.dit_cache*/
+
+# Caches
+.cache/
+.gradio_cache/
+huggingface/
+*.log
+tmp/
+temp/
+
+# Nested upstream git metadata (vendored as plain files)
+vendor/DVD/.git.bak.nested/
+vendor/DVD/.git/

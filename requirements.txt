@@ -1,0 +1,30 @@
+# MPS / macOS-friendly deps for DVD video depth estimation.
+# CUDA-only packages (cupy-cuda12x, deepspeed, pynvml, spaces) are omitted.
+
+torch>=2.5.0
+torchvision>=0.20.0
+transformers>=4.40.0
+controlnet-aux==0.0.7
+imageio
+imageio[ffmpeg]
+safetensors
+einops
+diffusers>=0.30.0
+sentencepiece
+protobuf
+modelscope
+ftfy
+pandas>=2.0.0
+accelerate>=0.33.0
+natsort
+omegaconf==2.3.0
+tabulate>=0.9.0
+peft>=0.12.0
+matplotlib>=3.8.0
+h5py>=3.10.0
+opencv-python-headless>=4.8.0
+huggingface_hub>=0.23.0
+tqdm
+numpy
+Pillow
+psutil>=5.9.0
