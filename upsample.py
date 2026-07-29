@@ -724,6 +724,13 @@ class ParallelUpscaler:
             self.workers = new_w
             self.max_inflight = max_inflight or max(2, self.workers * 2)
 
+    @property
+    def frame_store(self) -> FrameMemmapStore:
+        """Float16 memmap backing store (for post-passes such as denoise)."""
+        if getattr(self, "_mm", None) is None:
+            raise RuntimeError("Upsample cache already closed")
+        return self._mm
+
     def pending(self) -> int:
         with self._lock:
             return max(0, self._submitted - self._completed)

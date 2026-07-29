@@ -172,22 +172,47 @@ def _finalize_upto(
     depth_windows: list[tuple[int, int]],
     total_frames: int,
     finalized_upto: int,
+    base_offset: int = 0,
 ) -> int:
     if upscaler is None:
         return finalized_upto
     if window_index + 1 < n_windows:
         next_start, _ = depth_windows[window_index + 1]
-        can_finalize_to = min(next_start, depth_aligned.shape[1], total_frames)
+        can_finalize_to = min(next_start, base_offset + depth_aligned.shape[1], total_frames)
     else:
-        can_finalize_to = min(depth_aligned.shape[1], total_frames)
+        can_finalize_to = min(base_offset + depth_aligned.shape[1], total_frames)
     if can_finalize_to > finalized_upto:
+        local_start = finalized_upto - base_offset
+        local_end = can_finalize_to - base_offset
         upscaler.submit_range(
-            depth_aligned[:, finalized_upto:can_finalize_to],
+            depth_aligned[:, local_start:local_end],
             finalized_upto,
             can_finalize_to,
         )
         return can_finalize_to
     return finalized_upto
+
+
+def _trim_depth_aligned(
+    depth_aligned: np.ndarray | None,
+    finalized_upto: int,
+    overlap: int,
+    base_offset: int,
+) -> tuple[np.ndarray | None, int]:
+    """Discard already-finalized frames from depth_aligned, keeping only the
+    overlap tail needed for aligning the next window.  Returns the trimmed
+    array and the new base offset."""
+    if depth_aligned is None or finalized_upto <= base_offset:
+        return depth_aligned, base_offset
+    keep_from_global = max(base_offset, finalized_upto - overlap)
+    keep_from_local = keep_from_global - base_offset
+    if keep_from_local <= 0:
+        return depth_aligned, base_offset
+    trimmed = depth_aligned[:, keep_from_local:].copy()
+    del depth_aligned
+    import gc
+    gc.collect()
+    return trimmed, keep_from_global
 
 
 def run_window_pipeline(
@@ -258,6 +283,7 @@ def run_window_pipeline(
             dtype=dtype,
             depth_windows=depth_windows,
             total_frames=total_frames,
+            overlap=overlap,
             device=device,
             free_memory=free_memory,
             streaming_reader_cls=streaming_reader_cls,
@@ -275,6 +301,7 @@ def run_window_pipeline(
         dtype=dtype,
         depth_windows=depth_windows,
         total_frames=total_frames,
+        overlap=overlap,
         device=device,
         free_memory=free_memory,
         streaming_reader_cls=streaming_reader_cls,
@@ -385,6 +412,7 @@ def _run_sequential(
     dtype,
     depth_windows,
     total_frames,
+    overlap,
     device,
     free_memory,
     streaming_reader_cls,
@@ -397,6 +425,8 @@ def _run_sequential(
     depth_aligned = None
     prev_end = None
     finalized_upto = 0
+    base_offset = 0
+    effective_overlap = overlap if overlap is not None else 0
     n_windows = len(depth_windows)
     window_timings: list[float] = []
     try:
@@ -433,7 +463,6 @@ def _run_sequential(
                 totals=window_timings,
             )
             print(f"  pipeline done. depth shape={inferred.depth.shape}", flush=True)
-            # Post/align is CPU-bound — pressure upsample workers.
             plan = governor.adjust(
                 pending_cpu_work=True,
                 pending_gpu_work=False,
@@ -458,7 +487,12 @@ def _run_sequential(
                 depth_windows=depth_windows,
                 total_frames=total_frames,
                 finalized_upto=finalized_upto,
+                base_offset=base_offset,
             )
+            if upscaler is not None:
+                depth_aligned, base_offset = _trim_depth_aligned(
+                    depth_aligned, finalized_upto, effective_overlap, base_offset,
+                )
             free_memory()
         if window_timings:
             total_infer = sum(window_timings)
@@ -476,6 +510,7 @@ def _run_sequential(
         upscaler,
         total_frames=total_frames,
         finalized_upto=finalized_upto,
+        base_offset=base_offset,
         free_memory=free_memory,
     )
 
@@ -489,6 +524,7 @@ def _run_overlapped(
     dtype,
     depth_windows,
     total_frames,
+    overlap,
     device,
     free_memory,
     streaming_reader_cls,
@@ -606,6 +642,7 @@ def _run_overlapped(
         depth_aligned = None
         prev_end = None
         finalized_upto = 0
+        base_offset = 0
         stabilized_upto = 0
         shot_idx = 0
         shot_stabilizer: IncrementalShotStabilizer | None = None
@@ -655,8 +692,10 @@ def _run_overlapped(
                 chunk_end = min(final_upto, shot_end)
                 if chunk_end <= stabilized_upto:
                     break
+                local_start = stabilized_upto - base_offset
+                local_end = chunk_end - base_offset
                 disps = _depth_frames_to_disparities(
-                    depth_aligned[:, stabilized_upto:chunk_end]
+                    depth_aligned[:, local_start:local_end]
                 )
                 emitted = shot_stabilizer.append(
                     disps,
@@ -675,7 +714,7 @@ def _run_overlapped(
                 item = infer_q.get()
                 if isinstance(item, _Sentinel):
                     if depth_aligned is not None:
-                        finalized_upto = min(depth_aligned.shape[1], total_frames)
+                        finalized_upto = min(base_offset + depth_aligned.shape[1], total_frames)
                         _stabilize_ready(finalized_upto, flush=True)
                     break
                 assert isinstance(item, InferredWindow)
@@ -707,8 +746,15 @@ def _run_overlapped(
                     depth_windows=depth_windows,
                     total_frames=total_frames,
                     finalized_upto=finalized_upto,
+                    base_offset=base_offset,
                 )
                 _stabilize_ready(finalized_upto, flush=False)
+                # Trim frames already consumed by stabilizer to bound RAM/GPU
+                trim_point = min(finalized_upto, stabilized_upto)
+                effective_overlap = overlap if overlap is not None else 0
+                depth_aligned, base_offset = _trim_depth_aligned(
+                    depth_aligned, trim_point, effective_overlap, base_offset,
+                )
                 del item
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
@@ -847,14 +893,17 @@ def _finish_align(
     *,
     total_frames: int,
     finalized_upto: int,
+    base_offset: int = 0,
     free_memory: Callable[..., None],
 ) -> tuple[np.ndarray | None, ParallelUpscaler | None]:
     if upscaler is not None:
         if depth_aligned is not None and finalized_upto < total_frames:
-            end_t = min(depth_aligned.shape[1], total_frames)
+            end_t = min(base_offset + depth_aligned.shape[1], total_frames)
             if end_t > finalized_upto:
+                local_start = finalized_upto - base_offset
+                local_end = end_t - base_offset
                 upscaler.submit_range(
-                    depth_aligned[:, finalized_upto:end_t],
+                    depth_aligned[:, local_start:local_end],
                     finalized_upto,
                     end_t,
                 )
@@ -864,4 +913,6 @@ def _finish_align(
 
     if depth_aligned is None:
         raise RuntimeError("No depth windows produced")
-    return depth_aligned[:, :total_frames], None
+    end_t = min(base_offset + depth_aligned.shape[1], total_frames)
+    local_end = end_t - base_offset
+    return depth_aligned[:, :local_end], None

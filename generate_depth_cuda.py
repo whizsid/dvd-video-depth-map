@@ -39,6 +39,11 @@ from upsample import (  # noqa: E402
     cleanup_stale_up_caches,
     default_upsample_params,
 )
+from denoise import (  # noqa: E402
+    ParallelDenoiser,
+    default_denoise_params,
+    denoise_depth_stack,
+)
 
 
 def resolve_local_cache_root(explicit: Path | None) -> Path:
@@ -324,6 +329,22 @@ def parse_args():
         help="Reuse stable up_cache_v_* memmap under --cache-dir",
     )
     parser.add_argument(
+        "--no-denoise",
+        action="store_true",
+        help="Skip per-frame kernel noise scan + bilateral removal",
+    )
+    parser.add_argument(
+        "--denoise-device",
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Run noise reduction on CUDA (default) or CPU",
+    )
+    parser.add_argument(
+        "--denoise-workers",
+        default="1",
+        help="CPU threads for denoise when --denoise-device cpu (auto|N)",
+    )
+    parser.add_argument(
         "--no-pipeline-parallel",
         action="store_true",
         help="Disable prep|infer|post overlap",
@@ -356,6 +377,7 @@ def main() -> None:
     os.chdir(REPO_ROOT)
 
     do_upsample = not args.no_upsample
+    do_denoise = not args.no_denoise
     if do_upsample and args.upsample_device == "cuda" and not args.no_pipeline_parallel:
         # Overlapping DiT + CUDA JBU fights for T4 VRAM; finish infer then upsample.
         args.no_pipeline_parallel = True
@@ -372,6 +394,7 @@ def main() -> None:
         f"dtype={dtype} | size={args.height}x{args.width} | "
         f"window={args.window_size} overlap={args.overlap} | "
         f"upsample={'JBU ' + str(args.upsample_workers) if do_upsample else 'off'} | "
+        f"denoise={args.denoise_device if do_denoise else 'off'} | "
         f"pipeline={'parallel' if pipeline_parallel else 'sequential'} | "
         f"cache={cache_root}",
         flush=True,
@@ -405,6 +428,18 @@ def main() -> None:
             f"JBU upsample: device={args.upsample_device} "
             f"edge_radius={upsample_params.edge_radius} "
             f"sigma_range={upsample_params.sigma_range}",
+            flush=True,
+        )
+    denoise_params = None
+    if do_denoise:
+        dn_h = orig_h if do_upsample else out_h
+        dn_w = orig_w if do_upsample else out_w
+        denoise_params = default_denoise_params(dn_h, dn_w)
+        print(
+            f"Noise reduction: device={args.denoise_device} "
+            f"kernel={denoise_params.kernel_size} "
+            f"noise_sigma={denoise_params.noise_sigma} "
+            f"(per-frame scan @ {dn_w}x{dn_h})",
             flush=True,
         )
 
@@ -450,6 +485,12 @@ def main() -> None:
     _release_infer_model()
     gd.free_memory(device)
 
+    def _denoise_workers() -> int:
+        text = str(args.denoise_workers).strip().lower()
+        if text == "auto":
+            return 1
+        return max(1, int(text))
+
     if upscaler is not None:
         print("Gathering upsampled frames (model freed)...", flush=True)
         upscaler.finish()
@@ -457,6 +498,13 @@ def main() -> None:
             f"Depth at native {orig_size[1]}x{orig_size[0]} via guided JBU.",
             flush=True,
         )
+        if do_denoise and denoise_params is not None:
+            ParallelDenoiser(
+                upscaler.frame_store,
+                denoise_params,
+                workers=_denoise_workers(),
+                device=args.denoise_device,
+            ).run()
         output_path = gd.save_grayscale_depth_from_upscaler(
             upscaler, origin_fps, args
         )
@@ -467,6 +515,14 @@ def main() -> None:
             f"(omit --no-upsample for full-res JBU).",
             flush=True,
         )
+        if do_denoise and denoise_params is not None:
+            print("Applying per-frame noise reduction (inference res)...", flush=True)
+            depth = denoise_depth_stack(
+                depth,
+                denoise_params,
+                device=args.denoise_device,
+                workers=_denoise_workers(),
+            )
         output_path = gd.save_grayscale_depth(depth, origin_fps, args)
     print(f"Done: {output_path}", flush=True)
 
