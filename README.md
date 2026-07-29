@@ -68,7 +68,7 @@ python generate_depth_cuda.py \
   --cache-dir .cache
 ```
 
-Defaults match upstream CUDA infer: **480×640**, window **81**, overlap **21**.
+Defaults are **VRAM-scaled**. On Colab/T4 (short windows for host RAM), infer is typically **544×960** so the GPU fills out; high-RAM hosts use upstream **480×640**, window **81**, overlap **21**. Colab/≤14 GiB RAM keeps window **17** / overlap **5**.
 
 ### Colab
 
