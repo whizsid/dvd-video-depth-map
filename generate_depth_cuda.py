@@ -102,77 +102,51 @@ def _cuda_vram_gib() -> float:
     return props.total_memory / (1024**3)
 
 
-def cuda_full_gpu_hw(*, low_host: bool) -> tuple[int, int]:
-    """Pick infer HxW that fills T4-class VRAM without fighting host RAM.
-
-    Temporal window (not spatial size) is what OOMs Colab system RAM, so low-host
-    keeps a short window but uses a larger spatial budget to utilize the GPU.
-    Long-window (high-RAM) stays near upstream 480×640 on T4 so peak activations
-    remain safe.
-    """
-    vram = _cuda_vram_gib()
-    if vram >= 20:
-        # A10 / L4 / etc.
-        return (720, 1280) if low_host else (544, 960)
-    if vram >= 12:
-        # T4 ~15 GiB: short windows leave VRAM headroom → larger spatial.
-        return (544, 960) if low_host else (480, 640)
-    if vram >= 8:
-        return (480, 832) if low_host else (480, 640)
-    return (416, 736) if low_host else (320, 576)
-
-
 def apply_low_host_ram_defaults(args: argparse.Namespace) -> argparse.Namespace:
-    """Shrink windows / disable prep overlap on Colab-class ~12 GiB hosts.
+    """Colab/T4-safe defaults: short windows for host RAM, mid HxW for VRAM.
 
-    Spatial resolution is sized from GPU VRAM (fuller T4 utilization). Host RAM
-    pressure is handled via short windows + sequential prep — not by shrinking
-    HxW (that left the GPU idle after the Colab OOM fixes).
+    Upstream 480×640 / window 81 fits DiT+VAE on a T4 when host RAM is ample.
+    On Colab (~12 GiB system RAM) we keep window 17, a mid spatial size between
+    the ultra-safe 320×576 and full 480×640, and a small overlap so neither
+    host OOM-killer nor CUDA OOM trips.
     """
     from resources import is_low_system_ram, total_ram_bytes
 
     mem_gb = total_ram_bytes() / (1024**3)
     low = is_low_system_ram() or _is_colab()
-    full_h, full_w = cuda_full_gpu_hw(low_host=low)
 
     # Resolve None → profile defaults (explicit CLI values always win).
     if low:
         if args.height is None:
-            args.height = full_h
+            args.height = 384
         if args.width is None:
-            args.width = full_w
+            args.width = 672
         if args.window_size is None:
             args.window_size = 17
         if args.overlap is None:
-            args.overlap = 5
+            args.overlap = 3
         if not args.no_pipeline_parallel:
             args.no_pipeline_parallel = True
         if str(args.upsample_workers) == "auto":
             args.upsample_workers = "1"
         print(
-            f"Low host RAM profile ({mem_gb:.1f} GiB"
+            f"Low host RAM / VRAM-safe profile ({mem_gb:.1f} GiB"
             f"{', Colab' if _is_colab() else ''}; "
-            f"VRAM {_cuda_vram_gib():.1f} GiB → {full_h}x{full_w}): "
+            f"VRAM {_cuda_vram_gib():.1f} GiB): "
             f"{args.height}x{args.width} window={args.window_size} "
             f"overlap={args.overlap} sequential prep|infer. "
-            "Pass explicit flags to override.",
+            "Pass --height/--width to raise if you have headroom.",
             flush=True,
         )
     else:
         if args.height is None:
-            args.height = full_h
+            args.height = 480
         if args.width is None:
-            args.width = full_w
+            args.width = 640
         if args.window_size is None:
             args.window_size = 81
         if args.overlap is None:
             args.overlap = 21
-        print(
-            f"Full-GPU CUDA profile (VRAM {_cuda_vram_gib():.1f} GiB): "
-            f"{args.height}x{args.width} window={args.window_size} "
-            f"overlap={args.overlap}.",
-            flush=True,
-        )
 
     return args
 
@@ -302,19 +276,13 @@ def parse_args():
         "--height",
         type=int,
         default=None,
-        help=(
-            "Inference height (default: VRAM-scaled full-GPU, e.g. 544 on T4/"
-            "Colab; 480 on high-RAM T4)"
-        ),
+        help="Inference height (default: 480, or 384 on Colab/≤14GiB RAM)",
     )
     parser.add_argument(
         "--width",
         type=int,
         default=None,
-        help=(
-            "Inference width (default: VRAM-scaled full-GPU, e.g. 960 on T4/"
-            "Colab; 640 on high-RAM T4)"
-        ),
+        help="Inference width (default: 640, or 672 on Colab/≤14GiB RAM)",
     )
     parser.add_argument(
         "--window-size",
@@ -326,7 +294,7 @@ def parse_args():
         "--overlap",
         type=int,
         default=None,
-        help="Window overlap (default: 21, or 5 on Colab/≤14GiB RAM)",
+        help="Window overlap (default: 21, or 3 on Colab/≤14GiB RAM)",
     )
     parser.add_argument(
         "--max-frames",
