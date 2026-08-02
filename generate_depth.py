@@ -133,23 +133,29 @@ def _forget_capture(cap: cv2.VideoCapture | None) -> None:
 
 
 def probe_video(video_path: str | Path) -> tuple[float, int, int, int]:
-    """Return fps, frame_count, orig_h, orig_w without loading frames."""
+    """Return fps, frame_count, orig_h, orig_w.
+
+    Always counts frames with ``grab()`` — ``CAP_PROP_FRAME_COUNT`` is frequently
+    wrong for H.264 (GoPro / phone clips), which then makes stabilize/upsample
+    request phantom frames past EOF.
+    """
     cap = open_video_capture(video_path)
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    reported = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if frame_count <= 0:
-        frame_count = 0
-        while cap.grab():
-            frame_count += 1
-        _forget_capture(cap)
-        cap = open_video_capture(video_path)
-        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = 0
+    while cap.grab():
+        frame_count += 1
     _forget_capture(cap)
     if frame_count <= 0:
         raise ValueError(f"No frames found in {video_path}")
+    if reported > 0 and frame_count != reported:
+        print(
+            f"Video probe: readable frames={frame_count} "
+            f"(container metadata said {reported})",
+            flush=True,
+        )
     return fps, frame_count, orig_h, orig_w
 
 

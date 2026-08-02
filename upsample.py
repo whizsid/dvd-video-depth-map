@@ -465,33 +465,59 @@ class _GuideGrayReader:
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open video for upsample guides: {self.path}")
         self.next_idx = 0
+        self._last_gray: np.ndarray | None = None
+        self._eof = False
+        self._pad_warned = False
 
     def close(self) -> None:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
 
+    def _to_gray(self, frame: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        if gray.shape[0] != self.out_h or gray.shape[1] != self.out_w:
+            gray = cv2.resize(
+                gray, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA
+            )
+        return gray
+
+    def _pad(self, idx: int) -> np.ndarray:
+        if self._last_gray is None:
+            raise RuntimeError(
+                f"Failed reading guide frame {idx} from {self.path} "
+                f"(EOF with no prior frame)"
+            )
+        if not self._pad_warned:
+            print(
+                f"  [upsample] guide video ended before frame {idx}; "
+                f"padding with last readable frame",
+                flush=True,
+            )
+            self._pad_warned = True
+        return self._last_gray
+
     def get(self, idx: int) -> np.ndarray:
+        if self._eof:
+            return self._pad(idx)
+
         if idx < self.next_idx:
             self.close()
             self.cap = cv2.VideoCapture(self.path)
             if not self.cap.isOpened():
                 raise RuntimeError(f"Cannot reopen video for guides: {self.path}")
             self.next_idx = 0
+            self._eof = False
 
         while self.next_idx <= idx:
             assert self.cap is not None
             ret, frame = self.cap.read()
             if not ret:
-                raise RuntimeError(
-                    f"Failed reading guide frame {self.next_idx} from {self.path}"
-                )
+                self._eof = True
+                return self._pad(idx)
+            gray = self._to_gray(frame)
+            self._last_gray = gray
             if self.next_idx == idx:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-                if gray.shape[0] != self.out_h or gray.shape[1] != self.out_w:
-                    gray = cv2.resize(
-                        gray, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA
-                    )
                 self.next_idx += 1
                 return gray
             self.next_idx += 1
