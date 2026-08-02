@@ -893,6 +893,142 @@ def normalize_disparity_to_bgr_u8(
     return cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
 
 
+def _resize_bgr(frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    if frame.shape[0] != out_h or frame.shape[1] != out_w:
+        return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    return frame
+
+
+def _open_stabilize_capture(video_path: str | Path) -> cv2.VideoCapture:
+    path = str(video_path)
+    for backend in (getattr(cv2, "CAP_FFMPEG", 0), 0):
+        cap = cv2.VideoCapture(path, backend) if backend else cv2.VideoCapture(path)
+        if cap.isOpened():
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            return cap
+    raise RuntimeError(f"Cannot open video for stabilization: {video_path}")
+
+
+def _decode_video_range(
+    video_path: str | Path,
+    start: int,
+    end: int,
+    out_w: int,
+    out_h: int,
+) -> list[np.ndarray]:
+    """Decode ``[start, end)`` with seek, falling back to linear grab on failure.
+
+    OpenCV's ``CAP_PROP_POS_FRAMES`` often *reports* success on H.264 while the
+    next ``read()`` fails — especially on late chunks. Prefer seek for speed,
+    then retry from frame 0 when the result is short.
+    """
+    need = max(0, int(end) - int(start))
+    if need == 0:
+        return []
+    start = int(start)
+    end = int(end)
+
+    def _grab_skip(cap: cv2.VideoCapture, until: int) -> int:
+        idx = 0
+        while idx < until:
+            if not cap.grab():
+                break
+            idx += 1
+        return idx
+
+    def _read_forward(cap: cv2.VideoCapture, idx: int) -> list[np.ndarray]:
+        out: list[np.ndarray] = []
+        while idx < end:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx >= start:
+                out.append(_resize_bgr(frame, out_w, out_h))
+            idx += 1
+        return out
+
+    def _linear_decode() -> list[np.ndarray]:
+        cap = _open_stabilize_capture(video_path)
+        try:
+            idx = _grab_skip(cap, start)
+            if idx < start:
+                return []
+            return _read_forward(cap, idx)
+        finally:
+            cap.release()
+
+    # Attempt 1: seek (fast path for late chunks / Drive).
+    frames: list[np.ndarray] = []
+    use_linear = start <= 0
+    if start > 0:
+        cap = _open_stabilize_capture(video_path)
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(start))
+            pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+            if abs(pos - start) > 2:
+                use_linear = True
+            else:
+                frames = _read_forward(cap, start)
+        finally:
+            cap.release()
+
+    if use_linear:
+        frames = _linear_decode()
+    elif len(frames) < need:
+        got = len(frames)
+        print(
+            f"  [stabilize] seek decode short ({got}/{need} frames for "
+            f"[{start}:{end})); retrying linear grab from 0",
+            flush=True,
+        )
+        frames = _linear_decode()
+
+    return frames
+
+
+def _pad_frame_list(
+    frames: list[np.ndarray | None],
+    *,
+    start: int,
+    bgr_store: object | None,
+) -> list[np.ndarray]:
+    """Fill holes / trailing EOF with nearest available frame (matches infer pad)."""
+    n = len(frames)
+    if n == 0:
+        return []
+    last: np.ndarray | None = None
+    for i in range(n):
+        if frames[i] is not None:
+            last = frames[i]
+        elif last is not None:
+            filled = last.copy()
+            frames[i] = filled
+            if bgr_store is not None:
+                try:
+                    bgr_store.put(start + i, filled)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+    first = next((f for f in frames if f is not None), None)
+    if first is None:
+        raise RuntimeError(
+            f"Failed to read stabilization frames [{start}:{start + n}) "
+            f"(no decodable frames)"
+        )
+    for i in range(n):
+        if frames[i] is None:
+            filled = first.copy()
+            frames[i] = filled
+            if bgr_store is not None:
+                try:
+                    bgr_store.put(start + i, filled)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+    return [frames[i] for i in range(n)]  # type: ignore[misc]
+
+
 def _read_video_frames(
     video_path: str | Path,
     start: int,
@@ -901,52 +1037,64 @@ def _read_video_frames(
     out_h: int,
     bgr_store: object | None = None,
 ) -> list[np.ndarray]:
+    need = max(0, int(end) - int(start))
+    if need == 0:
+        return []
+    start = int(start)
+    end = int(end)
+    slots: list[np.ndarray | None] = [None] * need
+
     if bgr_store is not None:
         try:
             return bgr_store.get_range(start, end)  # type: ignore[attr-defined]
         except KeyError as exc:
+            existing: dict[int, np.ndarray] = {}
+            getter = getattr(bgr_store, "get_existing", None)
+            if callable(getter):
+                try:
+                    existing = getter(start, end)
+                except Exception:
+                    existing = {}
+            for idx, frame in existing.items():
+                li = idx - start
+                if 0 <= li < need:
+                    slots[li] = frame
+            n_hit = sum(1 for f in slots if f is not None)
             print(
-                f"  [stabilize] bgr_store miss ({exc}); decoding from video "
-                f"[{start}:{end}) — slow on Drive mounts",
+                f"  [stabilize] bgr_store miss ({exc}); "
+                f"have {n_hit}/{need} cached, decoding gaps "
+                f"[{start}:{end})",
                 flush=True,
             )
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video for stabilization: {video_path}")
-    frames: list[np.ndarray] = []
-    # Prefer seek — linear skip from 0 is catastrophic for late chunks / Drive.
-    if start > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, float(start))
-        idx = start
-        # Some backends ignore seek; fall back to grab-skip if position is wrong.
-        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-        if abs(pos - start) > 2:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            idx = 0
-            while idx < start:
-                if not cap.grab():
-                    break
-                idx += 1
-    else:
-        idx = 0
-    while idx < end:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx >= start:
-            if frame.shape[0] != out_h or frame.shape[1] != out_w:
-                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            frames.append(frame)
+
+    if all(f is not None for f in slots):
+        return [f for f in slots if f is not None]  # type: ignore[misc]
+
+    missing = [start + i for i, f in enumerate(slots) if f is None]
+    decode_start = missing[0]
+    decode_end = missing[-1] + 1
+    decoded = _decode_video_range(
+        video_path, decode_start, decode_end, out_w, out_h
+    )
+    for offset, frame in enumerate(decoded):
+        abs_i = decode_start + offset
+        li = abs_i - start
+        if 0 <= li < need and slots[li] is None:
+            slots[li] = frame
             if bgr_store is not None:
                 try:
-                    bgr_store.put(idx, frame)  # type: ignore[attr-defined]
+                    bgr_store.put(abs_i, frame)  # type: ignore[attr-defined]
                 except Exception:
                     pass
-        idx += 1
-    cap.release()
-    if len(frames) < max(0, end - start):
-        raise RuntimeError(f"Failed to read stabilization frames [{start}:{end}) from {video_path}")
-    return frames
+
+    n_got = sum(1 for f in slots if f is not None)
+    if n_got < need:
+        print(
+            f"  [stabilize] video ended early for [{start}:{end}) "
+            f"({n_got}/{need} frames); padding with last frame",
+            flush=True,
+        )
+    return _pad_frame_list(slots, start=start, bgr_store=bgr_store)
 
 
 def apply_flow_temporal_median(

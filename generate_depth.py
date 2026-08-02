@@ -202,6 +202,13 @@ class InferResBgrStore:
                 )
             return [self._frames[i] for i in range(start, end)]
 
+    def get_existing(self, start: int, end: int) -> dict[int, np.ndarray]:
+        """Return whichever frames in ``[start, end)`` are already cached."""
+        with self._lock:
+            return {
+                i: self._frames[i] for i in range(start, end) if i in self._frames
+            }
+
     def try_get_pair(self, idx: int) -> tuple[np.ndarray, np.ndarray] | None:
         """Return ``(frame[idx], frame[idx+1])`` if both present."""
         with self._lock:
@@ -289,16 +296,18 @@ class StreamingWindowReader:
                 raise RuntimeError(
                     f"Failed to read frames [{start}:{end}] from {self.path}"
                 )
-            last = self.cache[max(self.cache)]
+            last_idx = max(self.cache)
+            last = self.cache[last_idx]
+            last_bgr = None
+            if self.bgr_store is not None:
+                try:
+                    last_bgr = self.bgr_store.get_range(last_idx, last_idx + 1)[0]
+                except Exception:
+                    last_bgr = None
             for i in missing:
                 self.cache[i] = last.clone()
-                if self.bgr_store is not None:
-                    # Best-effort: reuse last BGR if store already has max key.
-                    try:
-                        last_bgr = self.bgr_store.get_range(max(self.cache), max(self.cache) + 1)[0]
-                        self.bgr_store.put(i, last_bgr)
-                    except Exception:
-                        pass
+                if self.bgr_store is not None and last_bgr is not None:
+                    self.bgr_store.put(i, last_bgr)
 
         frames = [self.cache[i] for i in range(start, end)]
         return torch.stack(frames, dim=0).unsqueeze(0)
