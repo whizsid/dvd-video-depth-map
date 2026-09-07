@@ -349,6 +349,20 @@ def parse_args():
         action="store_true",
         help="Disable prep|infer|post overlap",
     )
+    parser.add_argument(
+        "--no-dark-enhance",
+        action="store_true",
+        help=(
+            "Skip dark-scene CLAHE / Scharr / saturation pre-pass on DVD input "
+            "(JBU and stabilize always use original RGB)"
+        ),
+    )
+    parser.add_argument(
+        "--dark-enhance-strength",
+        type=float,
+        default=1.0,
+        help="Dark-scene pre-pass amount (0–2, default 1.0; adaptive to frame darkness)",
+    )
     return parser.parse_args()
 
 
@@ -395,6 +409,7 @@ def main() -> None:
         f"window={args.window_size} overlap={args.overlap} | "
         f"upsample={'JBU ' + str(args.upsample_workers) if do_upsample else 'off'} | "
         f"denoise={args.denoise_device if do_denoise else 'off'} | "
+        f"dark_enhance={'off' if args.no_dark_enhance else f'clahe+edge x{args.dark_enhance_strength:g}'} | "
         f"pipeline={'parallel' if pipeline_parallel else 'sequential'} | "
         f"cache={cache_root}",
         flush=True,
@@ -479,6 +494,8 @@ def main() -> None:
             release_infer_model=_release_infer_model
             if (do_upsample and not pipeline_parallel)
             else None,
+            dark_enhance=not args.no_dark_enhance,
+            dark_enhance_strength=args.dark_enhance_strength,
         )
         gd.free_memory(device)
 

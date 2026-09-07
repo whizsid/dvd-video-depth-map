@@ -280,7 +280,71 @@ def joint_bilateral_upsample(
     return (acc / np.maximum(acc_w, 1e-8)).astype(np.float32)
 
 
-def joint_bilateral_upsample_cuda(
+def _resolve_torch_jbu_device(device: str) -> str | None:
+    """Return a usable torch device for JBU, or None for CPU fallback."""
+    dev = str(device or "cpu").lower()
+    if dev in ("", "cpu"):
+        return None
+    try:
+        import torch
+    except Exception:
+        return None
+    if dev.startswith("cuda"):
+        return dev if torch.cuda.is_available() else None
+    if dev.startswith("mps"):
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+        return None
+    return None
+
+
+def _torch_area_downsample(
+    tensor: "torch.Tensor", out_h: int, out_w: int
+) -> "torch.Tensor":
+    """Area downsample; MPS adaptive_avg_pool needs divisible sizes."""
+    import torch
+    import torch.nn.functional as F
+
+    hi_h, hi_w = int(tensor.shape[-2]), int(tensor.shape[-1])
+    if hi_h == out_h and hi_w == out_w:
+        return tensor.view(out_h, out_w)
+    divisible = hi_h % out_h == 0 and hi_w % out_w == 0
+    if tensor.device.type != "mps" and divisible:
+        return F.interpolate(
+            tensor.view(1, 1, hi_h, hi_w), size=(out_h, out_w), mode="area"
+        ).view(out_h, out_w)
+    arr = tensor.detach().float().cpu().numpy()
+    if arr.ndim > 2:
+        arr = arr.reshape(hi_h, hi_w)
+    down = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    return torch.from_numpy(np.ascontiguousarray(down, dtype=np.float32)).to(
+        tensor.device
+    )
+
+
+def _torch_nearest_upsample(
+    tensor: "torch.Tensor", out_h: int, out_w: int
+) -> "torch.Tensor":
+    """Nearest upsample; OpenCV fallback only when torch raises on MPS."""
+    import torch
+    import torch.nn.functional as F
+
+    lo_h, lo_w = int(tensor.shape[-2]), int(tensor.shape[-1])
+    if lo_h == out_h and lo_w == out_w:
+        return tensor.view(out_h, out_w)
+    view = tensor.view(1, 1, lo_h, lo_w)
+    try:
+        return F.interpolate(view, size=(out_h, out_w), mode="nearest").view(out_h, out_w)
+    except RuntimeError:
+        arr = tensor.detach().float().cpu().numpy().reshape(lo_h, lo_w)
+        up = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+        return torch.from_numpy(np.ascontiguousarray(up, dtype=np.float32)).to(
+            tensor.device
+        )
+
+
+def joint_bilateral_upsample_torch(
     disp_low: np.ndarray,
     guide_gray: np.ndarray,
     radius: int,
@@ -289,9 +353,8 @@ def joint_bilateral_upsample_cuda(
     *,
     device: str = "cuda",
 ) -> np.ndarray:
-    """Same JBU as ``joint_bilateral_upsample``, accumulated on CUDA."""
+    """Same JBU as ``joint_bilateral_upsample``, accumulated on CUDA/MPS."""
     import torch
-    import torch.nn.functional as F
 
     hi_h, hi_w = guide_gray.shape[:2]
     lo_h, lo_w = disp_low.shape[:2]
@@ -307,20 +370,17 @@ def joint_bilateral_upsample_cuda(
     disp = torch.from_numpy(np.ascontiguousarray(disp_low, dtype=np.float32)).to(
         dev, non_blocking=True
     )
-    # guide_low via area downsample
-    guide_b = guide.view(1, 1, hi_h, hi_w)
-    guide_low = F.interpolate(guide_b, size=(lo_h, lo_w), mode="area").view(lo_h, lo_w)
-    disp_b = disp.view(1, 1, lo_h, lo_w)
+    guide_low = _torch_area_downsample(guide, lo_h, lo_w)
 
     acc = torch.zeros((hi_h, hi_w), device=dev, dtype=torch.float32)
     acc_w = torch.zeros((hi_h, hi_w), device=dev, dtype=torch.float32)
 
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
-            d_shift = torch.roll(disp, shifts=(dy, dx), dims=(0, 1)).view(1, 1, lo_h, lo_w)
-            g_shift = torch.roll(guide_low, shifts=(dy, dx), dims=(0, 1)).view(1, 1, lo_h, lo_w)
-            d_up = F.interpolate(d_shift, size=(hi_h, hi_w), mode="nearest").view(hi_h, hi_w)
-            g_up = F.interpolate(g_shift, size=(hi_h, hi_w), mode="nearest").view(hi_h, hi_w)
+            d_shift = torch.roll(disp, shifts=(dy, dx), dims=(0, 1))
+            g_shift = torch.roll(guide_low, shifts=(dy, dx), dims=(0, 1))
+            d_up = _torch_nearest_upsample(d_shift, hi_h, hi_w)
+            g_up = _torch_nearest_upsample(g_shift, hi_h, hi_w)
             w_spatial = math.exp(-(dx * dx + dy * dy) * inv_2ss)
             diff = guide - g_up
             w = w_spatial * torch.exp(-(diff * diff) * inv_2sr)
@@ -331,7 +391,27 @@ def joint_bilateral_upsample_cuda(
     return out.detach().float().cpu().numpy().astype(np.float32, copy=False)
 
 
-def _depth_edge_weight_cuda(depth: np.ndarray, feather: float, *, device: str = "cuda") -> np.ndarray:
+def joint_bilateral_upsample_cuda(
+    disp_low: np.ndarray,
+    guide_gray: np.ndarray,
+    radius: int,
+    sigma_range: float,
+    sigma_spatial: float | None = None,
+    *,
+    device: str = "cuda",
+) -> np.ndarray:
+    """Backward-compatible alias for ``joint_bilateral_upsample_torch``."""
+    return joint_bilateral_upsample_torch(
+        disp_low,
+        guide_gray,
+        radius,
+        sigma_range,
+        sigma_spatial,
+        device=device,
+    )
+
+
+def _depth_edge_weight_torch(depth: np.ndarray, feather: float, *, device: str = "cuda") -> np.ndarray:
     import torch
     import torch.nn.functional as F
 
@@ -379,6 +459,11 @@ def _depth_edge_weight_cuda(depth: np.ndarray, feather: float, *, device: str = 
     return w.detach().float().cpu().numpy().astype(np.float32, copy=False)
 
 
+def _depth_edge_weight_cuda(depth: np.ndarray, feather: float, *, device: str = "cuda") -> np.ndarray:
+    """Backward-compatible alias for ``_depth_edge_weight_torch``."""
+    return _depth_edge_weight_torch(depth, feather, device=device)
+
+
 def sharp_upsample(
     disp_low: np.ndarray,
     guide_gray: np.ndarray,
@@ -392,7 +477,7 @@ def sharp_upsample(
 
     ``guide_gray`` must be full-res float32 in [0, 1] (RGB luminance).
     ``out_size`` is (width, height).
-    ``device``: ``\"cpu\"`` (OpenCV/NumPy) or ``\"cuda\"`` (Torch JBU on GPU).
+    ``device``: ``\"cpu\"`` (OpenCV/NumPy) or ``\"cuda\"`` / ``\"mps\"`` (Torch JBU).
     """
     out_w, out_h = out_size
     if guide_gray.shape[:2] != (out_h, out_w):
@@ -404,25 +489,17 @@ def sharp_upsample(
         np.float32
     )
     jbu_radius = max(1, int(round(params.edge_radius / 2.0)))
-    use_cuda = str(device).startswith("cuda")
-    if use_cuda:
-        try:
-            import torch
+    torch_dev = _resolve_torch_jbu_device(device)
 
-            if not torch.cuda.is_available():
-                use_cuda = False
-        except Exception:
-            use_cuda = False
-
-    if use_cuda:
-        jbu = joint_bilateral_upsample_cuda(
+    if torch_dev is not None:
+        jbu = joint_bilateral_upsample_torch(
             disp_low,
             guide_gray,
             radius=jbu_radius,
             sigma_range=params.sigma_range,
-            device=device,
+            device=torch_dev,
         )
-        dw_low = _depth_edge_weight_cuda(disp_low, feather=1.0, device=device)
+        dw_low = _depth_edge_weight_torch(disp_low, feather=1.0, device=torch_dev)
     else:
         jbu = joint_bilateral_upsample(
             disp_low,

@@ -30,3 +30,5 @@ tqdm
 numpy
 Pillow
 psutil>=5.9.0
+rawpy>=0.22.0
+# Photo depth (DA3): pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git

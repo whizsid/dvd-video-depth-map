@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -61,6 +62,7 @@ from upsample import (  # noqa: E402
     cleanup_stale_up_caches,
     default_upsample_params,
 )
+from dark_enhance import DarkEdgePrepass, default_dark_enhance_params  # noqa: E402
 from denoise import (  # noqa: E402
     ParallelDenoiser,
     default_denoise_params,
@@ -169,11 +171,25 @@ def inference_hw(orig_h: int, orig_w: int, target_h: int, target_w: int) -> tupl
     return new_h, new_w
 
 
-def _preprocess_bgr_frame(frame_bgr, out_h: int, out_w: int, dtype: torch.dtype) -> torch.Tensor:
-    """BGR uint8 -> RGB float CHW at inference resolution (no full-res float copy)."""
+def _preprocess_bgr_frame(
+    frame_bgr,
+    out_h: int,
+    out_w: int,
+    dtype: torch.dtype,
+    enhance: DarkEdgePrepass | None = None,
+) -> torch.Tensor:
+    """BGR uint8 -> RGB float CHW at inference resolution (no full-res float copy).
+
+    Optional dark-scene CLAHE/edge pre-pass runs at infer size on a copy so
+    ``bgr_store`` / JBU still see the original pixels.
+    """
+    if frame_bgr.shape[0] != out_h or frame_bgr.shape[1] != out_w:
+        frame_bgr = cv2.resize(
+            frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA
+        )
+    if enhance is not None:
+        frame_bgr = enhance(frame_bgr)
     frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    if frame.shape[0] != out_h or frame.shape[1] != out_w:
-        frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
     tensor = torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1).to(
         dtype=dtype
     ) / 255.0
@@ -245,12 +261,14 @@ class StreamingWindowReader:
         out_w: int,
         dtype: torch.dtype,
         bgr_store: InferResBgrStore | None = None,
+        dark_enhance: DarkEdgePrepass | None = None,
     ):
         self.path = str(video_path)
         self.out_h = out_h
         self.out_w = out_w
         self.dtype = dtype
         self.bgr_store = bgr_store
+        self.dark_enhance = dark_enhance
         self.cap = open_video_capture(self.path)
         self.next_idx = 0
         self.cache: dict[int, torch.Tensor] = {}
@@ -286,7 +304,11 @@ class StreamingWindowReader:
                 if self.bgr_store is not None:
                     self.bgr_store.put(self.next_idx, frame)
                 self.cache[self.next_idx] = _preprocess_bgr_frame(
-                    frame, self.out_h, self.out_w, self.dtype
+                    frame,
+                    self.out_h,
+                    self.out_w,
+                    self.dtype,
+                    enhance=self.dark_enhance,
                 )
             self.next_idx += 1
             if (self.next_idx - start) % 4 == 0 or self.next_idx == end:
@@ -1302,6 +1324,8 @@ def generate_depth_from_video(
     shot_ranges: tuple[tuple[int, int], ...] | None = None,
     upsample_device: str = "cpu",
     release_infer_model: Callable | None = None,
+    dark_enhance: bool = True,
+    dark_enhance_strength: float = 1.0,
 ) -> tuple[np.ndarray | None, float, tuple[int, int], ParallelUpscaler | None]:
     """Windowed inference with optional prep|infer|post resource-aware pipeline.
 
@@ -1366,6 +1390,21 @@ def generate_depth_from_video(
     )
 
     bgr_store = InferResBgrStore(out_h, out_w)
+    enhancer: DarkEdgePrepass | None = None
+    if dark_enhance and float(dark_enhance_strength) > 0.0:
+        enhancer = DarkEdgePrepass(
+            default_dark_enhance_params(strength=float(dark_enhance_strength))
+        )
+        print(
+            f"Dark-scene pre-pass: CLAHE + Scharr edges + sat "
+            f"(strength={float(dark_enhance_strength):.2f}; DVD input only)",
+            flush=True,
+        )
+    reader_cls = (
+        partial(StreamingWindowReader, dark_enhance=enhancer)
+        if enhancer is not None
+        else StreamingWindowReader
+    )
     run_upsample = bool(upsample)
     if pipeline_parallel:
         print(
@@ -1397,7 +1436,7 @@ def generate_depth_from_video(
             orig_w=orig_w,
             device=device,
             free_memory=free_memory,
-            streaming_reader_cls=StreamingWindowReader,
+            streaming_reader_cls=reader_cls,
             governor=governor,
             upsample=run_upsample,
             upsample_params=upsample_params,
@@ -1425,7 +1464,7 @@ def generate_depth_from_video(
         orig_w=orig_w,
         device=device,
         free_memory=free_memory,
-        streaming_reader_cls=StreamingWindowReader,
+        streaming_reader_cls=reader_cls,
         governor=governor,
         upsample=False,
         upsample_params=upsample_params,
@@ -1671,6 +1710,20 @@ def parse_args():
         action="store_true",
         help="Disable prep|infer|post overlap (run windows sequentially)",
     )
+    parser.add_argument(
+        "--no-dark-enhance",
+        action="store_true",
+        help=(
+            "Skip dark-scene CLAHE / Scharr / saturation pre-pass on DVD input "
+            "(JBU and stabilize always use original RGB)"
+        ),
+    )
+    parser.add_argument(
+        "--dark-enhance-strength",
+        type=float,
+        default=1.0,
+        help="Dark-scene pre-pass amount (0–2, default 1.0; adaptive to frame darkness)",
+    )
     return parser.parse_args()
 
 
@@ -1779,6 +1832,7 @@ def main() -> None:
         f"upsample={'JBU ' + str(args.upsample_workers) if do_upsample else 'off'}"
         f"{' keep-cache' if getattr(args, 'keep_upsample_cache', False) else ''} | "
         f"denoise={denoise_device if do_denoise else 'off'} | "
+        f"dark_enhance={'off' if args.no_dark_enhance else f'clahe+edge x{args.dark_enhance_strength:g}'} | "
         f"pipeline={'parallel' if pipeline_parallel else 'sequential'}",
         flush=True,
     )
@@ -1873,6 +1927,8 @@ def main() -> None:
             keep_upsample_cache=bool(args.keep_upsample_cache),
             probe=(fps_probe, total_probe, orig_h, orig_w),
             shot_ranges=shot_ranges,
+            dark_enhance=not args.no_dark_enhance,
+            dark_enhance_strength=args.dark_enhance_strength,
         )
         free_memory(device if device.type == "mps" else None)
 

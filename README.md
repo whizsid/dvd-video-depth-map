@@ -5,9 +5,12 @@ Generate **grayscale depth-map videos** with [EnVision-Research/DVD](https://git
 ## Setup
 
 ```bash
-# 1. Create & activate the venv (already created if you followed the project bootstrap)
+# 1. Create & activate the venv
 python3.10 -m venv .venv
 source .venv/bin/activate
+
+# Or use the helper script (creates venv + installs everything):
+# bash scripts/setup_venv.sh
 
 # 2. Install PyTorch + project deps
 pip install -r requirements.txt
@@ -20,6 +23,49 @@ HF_TOKEN=… python scripts/download_weights.py
 ```
 
 Weights land in `ckpt/` (`dvd_1.1.safetensors`, `model_config.yaml`). On first inference, DVD also downloads Wan2.1 backbone files into `./models/`.
+
+### Photo depth (CR3 / stills, DA3)
+
+For **still photos** (Canon CR3 and other RAW, plus JPEG/PNG/TIFF), install Depth Anything 3 and optional RAW support:
+
+```bash
+pip install rawpy
+pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
+# If rawpy fails to build on macOS:
+# brew install libraw && pip install rawpy
+```
+
+Generate six PFMs per image (depth, inverse, min/max and their complements):
+
+```bash
+python generate_depth_photo.py \
+  --input-dir /path/to/photos \
+  --device mps \
+  --model da3-small
+```
+
+Output layout (child folder named after each image stem):
+
+```
+photos/IMG_1234.CR3
+photos/IMG_1234/depth.pfm
+photos/IMG_1234/inverse.pfm
+photos/IMG_1234/min.pfm
+photos/IMG_1234/min_inverse.pfm
+photos/IMG_1234/max.pfm
+photos/IMG_1234/max_inverse.pfm
+```
+
+Uses **DA3-SMALL** by default (fast on MPS). Depth is inferred at **`process_res=auto`** (picks the highest safe long-side for your RAM, model, and device — e.g. **1008** for `da3-large` on 16 GiB MPS), then restored to native resolution with the same **Lanczos + RGB-guided JBU** as the video pipeline, followed by per-frame **denoise** and **edge smoothing**. Min/max PFMs are percentile-scaled to 0–1; min/max inverse are complements (`1 - x`).
+
+| Flag | Default | Notes |
+|------|---------|--------|
+| `--model` | `da3-small` | Also: `da3-base`, `da3-large`, `da3metric-large`, … |
+| `--process-res` | `auto` | Long-side infer target; auto scales to RAM/model (up to 1680). Manual: e.g. `1008` |
+| `--no-upsample` | off | Keep infer resolution |
+| `--no-denoise` | off | Skip bilateral noise removal |
+| `--no-edge-smooth` | off | Skip RGB-guided edge polish |
+| `--overwrite` | off | Re-process folders that already have all six PFMs |
 
 ## Generate a grayscale depth video
 
@@ -48,8 +94,12 @@ Output: `outputs/<name>_depth_gray.mp4`
 | `--upsample-workers` | `auto` | JBU threads (`auto` sizes from RAM/CPU) |
 | `--keep-upsample-cache` | off | Keep/reuse per-video `up_cache_v_*` memmap (skips slow FAT32 re-alloc on re-runs) |
 | `--no-pipeline-parallel` | off | Disable prep‖infer‖post overlap |
+| `--no-dark-enhance` | off | Skip dark-scene CLAHE + Scharr/saturation pre-pass on DVD input |
+| `--dark-enhance-strength` | `1.0` | 0–2; adaptive contrast/edge amount (stronger in crushed shadows) |
 
 Depth is inferred at a small resolution, then restored to the original video size with **Lanczos + joint bilateral upsampling** guided by the source RGB (same approach as the depth-anything streaming pipeline).
+
+Dark scenes get an adaptive **CLAHE + cheap Scharr/saturation** pre-pass **before VAE encode**, so silhouettes (heads, limbs) stay visible when people walk into shadow. JBU and stabilize still use the original RGB. Disable with `--no-dark-enhance`, or raise `--dark-enhance-strength` (e.g. `1.4`) for very crushed night footage.
 
 A **prep | infer | post** assembly line overlaps decode, DVD/MPS inference, and CPU JBU. A resource governor watches RAM / CPU / MPS and **pressures toward ≥90%** usable utilization (grows upsample workers and prep queue depth; sheds near OOM).
 
@@ -68,7 +118,7 @@ python generate_depth_cuda.py \
   --cache-dir .cache
 ```
 
-Defaults match upstream CUDA infer: **480×640**, window **81**, overlap **21**. On Colab/≤14 GiB RAM the script auto-selects **384×672**, window **17**, overlap **3** (sequential) so neither host RAM nor T4 VRAM OOMs.
+Defaults match upstream CUDA infer: **480×640**, window **81**, overlap **21**. On Colab/≤14 GiB RAM the script auto-selects **384×672**, window **17**, overlap **3** (sequential) so neither host RAM nor T4 VRAM OOMs. Same dark-scene pre-pass as the MPS CLI (`--no-dark-enhance` / `--dark-enhance-strength`).
 
 ### Colab
 
@@ -79,7 +129,11 @@ Open [`notebooks/dvd_colab_t4.ipynb`](notebooks/dvd_colab_t4.ipynb) on a **T4** 
 ```
 .
 ├── generate_depth.py          # CLI (grayscale + MPS block-swap)
+├── generate_depth_photo.py    # CLI (CR3/stills → DA3 depth PFMs, MPS)
 ├── generate_depth_cuda.py     # CLI (full CUDA GPU residency)
+├── dark_enhance.py            # Dark-scene CLAHE + Scharr pre-pass (DVD input)
+├── edge_smooth.py             # RGB-guided depth edge polish (photos)
+├── pfm.py                     # Middlebury PFM writer
 ├── notebooks/dvd_colab_t4.ipynb
 ├── cache_root.py              # External FAT32 + local DiT cache resolution (MPS)
 ├── pipeline.py                # prep | infer | post assembly line
