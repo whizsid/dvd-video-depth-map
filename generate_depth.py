@@ -485,6 +485,30 @@ def parse_args() -> argparse.Namespace:
         help="Run joint-bilateral upsample on CUDA (default) or CPU",
     )
     parser.add_argument(
+        "--jbu-sigma-range",
+        type=float,
+        default=None,
+        help="JBU RGB range sigma (default 0.14; higher = less RGB texture bleed)",
+    )
+    parser.add_argument(
+        "--jbu-edge-strength",
+        type=float,
+        default=None,
+        help="JBU blend strength at edges (default 0.55; lower = less hair, softer edges)",
+    )
+    parser.add_argument(
+        "--jbu-depth-gate",
+        type=float,
+        default=None,
+        help="How strongly JBU is limited to depth edges (default 0.5; lower = more Lanczos)",
+    )
+    parser.add_argument(
+        "--jbu-edge-radius",
+        type=int,
+        default=None,
+        help="JBU neighborhood radius override (default: ~0.75 * upscale)",
+    )
+    parser.add_argument(
         "--keep-upsample-cache",
         action="store_true",
         help="Reuse stable up_cache_v_* memmap under --cache-dir",
@@ -654,11 +678,22 @@ def main() -> None:
 
     upsample_params = None
     if do_upsample:
-        upsample_params = default_upsample_params(out_h, out_w, orig_h, orig_w)
+        upsample_params = default_upsample_params(
+            out_h,
+            out_w,
+            orig_h,
+            orig_w,
+            edge_radius=args.jbu_edge_radius,
+            sigma_range=args.jbu_sigma_range,
+            edge_strength=args.jbu_edge_strength,
+            depth_gate=args.jbu_depth_gate,
+        )
         print(
             f"JBU upsample: device={args.upsample_device} "
             f"edge_radius={upsample_params.edge_radius} "
-            f"sigma_range={upsample_params.sigma_range}",
+            f"sigma_range={upsample_params.sigma_range} "
+            f"edge_strength={upsample_params.edge_strength} "
+            f"depth_gate={upsample_params.depth_gate}",
             flush=True,
         )
 

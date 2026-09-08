@@ -53,6 +53,10 @@ Output: `outputs/<name>_depth_gray.mp4`
 | `--unet-path` / `--svd-path` | auto | Local `ckpt/…` dirs or HF ids |
 | `--no-upsample` | off | Skip RGB-guided JBU (keep infer res) |
 | `--upsample-device` | `cuda` | JBU on CUDA or CPU |
+| `--jbu-sigma-range` | `0.14` | Higher → less RGB texture / hair bleed |
+| `--jbu-edge-strength` | `0.55` | Lower → softer edges, less filamenting |
+| `--jbu-depth-gate` | `0.5` | Lower → more Lanczos, less JBU at edges |
+| `--jbu-edge-radius` | auto | Override JBU neighborhood (~0.75× upscale) |
 | `--keep-upsample-cache` | off | Reuse stable `up_cache_v_*` memmap |
 | `--no-denoise` | off | Skip bilateral noise removal |
 | `--no-stabilize` | off | Skip shot band-lock + temporal median |

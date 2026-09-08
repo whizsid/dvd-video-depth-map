@@ -27,10 +27,11 @@ from da3_stabilize import normalize_disparity_to_bgr_u8
 
 @dataclass(frozen=True)
 class UpsampleParams:
+    # Softer defaults reduce RGB-bleed "hair" filaments around objects.
     edge_radius: int = 2
-    sigma_range: float = 0.08
-    edge_strength: float = 1.0
-    depth_gate: float = 0.85
+    sigma_range: float = 0.14
+    edge_strength: float = 0.55
+    depth_gate: float = 0.5
 
 
 def cleanup_stale_up_caches(
@@ -214,15 +215,24 @@ class FrameMemmapStore:
 
 
 def default_upsample_params(
-    infer_h: int, infer_w: int, orig_h: int, orig_w: int
+    infer_h: int,
+    infer_w: int,
+    orig_h: int,
+    orig_w: int,
+    *,
+    edge_radius: int | None = None,
+    sigma_range: float | None = None,
+    edge_strength: float | None = None,
+    depth_gate: float | None = None,
 ) -> UpsampleParams:
     upscale = max(orig_h / max(infer_h, 1), orig_w / max(infer_w, 1))
-    edge_radius = max(1, int(math.ceil(upscale)))
+    # Slightly tighter than ceil(upscale) to limit JBU reach on large upscales.
+    auto_radius = max(1, int(math.ceil(upscale * 0.75)))
     return UpsampleParams(
-        edge_radius=edge_radius,
-        sigma_range=0.08,
-        edge_strength=1.0,
-        depth_gate=0.85,
+        edge_radius=max(1, int(edge_radius)) if edge_radius is not None else auto_radius,
+        sigma_range=float(sigma_range) if sigma_range is not None else 0.14,
+        edge_strength=float(edge_strength) if edge_strength is not None else 0.55,
+        depth_gate=float(depth_gate) if depth_gate is not None else 0.5,
     )
 
 
