@@ -1,34 +1,26 @@
-# MPS / macOS-friendly deps for DVD video depth estimation.
-# CUDA-only packages (cupy-cuda12x, deepspeed, pynvml, spaces) are omitted.
+# Shared deps for DepthCrafter video depth (CUDA) and DA3 photo depth.
+# CUDA-only packages (xformers) are optional — enabled at runtime if present.
+# Colab provides CUDA torch; Mac venv is primarily for photo/DA3.
 
 torch>=2.5.0
 torchvision>=0.20.0
 transformers>=4.40.0
-controlnet-aux==0.0.7
-imageio
-imageio[ffmpeg]
+diffusers>=0.30.0
+accelerate>=0.33.0
 safetensors
 einops
-diffusers>=0.30.0
 sentencepiece
 protobuf
-modelscope
-ftfy
-pandas>=2.0.0
-accelerate>=0.33.0
-natsort
-omegaconf==2.3.0
-tabulate>=0.9.0
-peft>=0.12.0
-# Note: recent peft hard-requires torchao>=0.16 if torchao is installed.
-# Colab ships torchao 0.10 — the Colab notebook uninstalls it (DVD does not need torchao).
-matplotlib>=3.8.0
-h5py>=3.10.0
-opencv-python-headless>=4.8.0
 huggingface_hub>=0.23.0
-tqdm
+opencv-python-headless>=4.8.0
+imageio
+imageio[ffmpeg]
 numpy
 Pillow
+tqdm
 psutil>=5.9.0
 rawpy>=0.22.0
 # Photo depth (DA3): pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
+# Optional video decode accel used by upstream DepthCrafter utils (we use OpenCV):
+# decord
+# Optional: xformers (CUDA) for memory-efficient attention

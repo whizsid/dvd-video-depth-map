@@ -523,7 +523,7 @@ def sharp_upsample(
 
 
 def depth_frame_to_disp(frame: np.ndarray) -> np.ndarray:
-    """Convert DVD depth frame [H,W,C] or [H,W] to single-channel float32."""
+    """Convert depth frame [H,W,C] or [H,W] to single-channel float32."""
     if frame.ndim == 3:
         if frame.shape[-1] == 1:
             return frame[..., 0].astype(np.float32)
@@ -656,7 +656,7 @@ def _meta_matches(existing: dict, expected: dict) -> bool:
 
 class ParallelUpscaler:
     """
-    Upscale finalized depth frames while DVD runs the next window.
+    Upscale finalized depth frames (optionally overlapped with infer).
 
     Jobs are submitted in frame order. A coordinator thread reads RGB guides and
     dispatches JBU work to a thread pool (CPU) or a single CUDA worker.

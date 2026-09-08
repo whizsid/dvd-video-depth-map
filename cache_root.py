@@ -1,9 +1,10 @@
-"""Resolve an external FAT32 (or explicit) root for DVD runtime caches.
+"""Resolve an external FAT32 (or explicit) root for runtime caches.
 
-DiT shards and upsample memmaps are large; keeping them off the project/APFS
-volume frees internal disk. Model weights (HF hub, ckpt/, models/) stay in the
-project. FAT32 caps a single file at <4 GiB — callers should use
-``fat32_max_file_bytes`` when allocating contiguous caches.
+Upsample memmaps can be large; keeping them off the project/APFS volume frees
+internal disk. Model weights (HF hub, ckpt/) stay in the project. FAT32 caps a
+single file at <4 GiB — callers should use ``fat32_max_file_bytes`` when
+allocating contiguous caches. The CUDA DepthCrafter path prefers local
+``.cache/`` via ``DEPTHCRAFTER_CACHE_DIR`` / ``DVD_CACHE_DIR``.
 """
 
 from __future__ import annotations
@@ -116,7 +117,7 @@ def pick_fat32_volume(*, min_free_gb: float = _MIN_FREE_GB) -> Path | None:
 def resolve_cache_root(
     explicit: str | Path | None = None,
     *,
-    env_var: str = "DVD_CACHE_DIR",
+    env_var: str = "DEPTHCRAFTER_CACHE_DIR",
     min_free_gb: float = _MIN_FREE_GB,
     create: bool = True,
 ) -> Path:
@@ -124,13 +125,17 @@ def resolve_cache_root(
 
     Order:
       1. ``explicit`` (CLI ``--cache-dir``)
-      2. ``$DVD_CACHE_DIR`` (or ``env_var``)
+      2. ``$DEPTHCRAFTER_CACHE_DIR``, then ``$DVD_CACHE_DIR`` (legacy alias)
       3. Auto-pick a mounted FAT32 volume → ``<vol>/dvd_cache``
     """
     if explicit is not None:
         root = Path(explicit).expanduser()
     else:
-        env = os.environ.get(env_var, "").strip()
+        env = (
+            os.environ.get(env_var, "").strip()
+            or os.environ.get("DVD_CACHE_DIR", "").strip()
+            or os.environ.get("DEPTHCRAFTER_CACHE_DIR", "").strip()
+        )
         if env:
             root = Path(env).expanduser()
         else:

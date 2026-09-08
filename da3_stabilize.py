@@ -1,4 +1,4 @@
-"""DA3-style temporal stabilization helpers for DVD depth video."""
+"""DA3-style temporal stabilization helpers for video depth."""
 
 from __future__ import annotations
 
@@ -748,7 +748,7 @@ def derive_stabilize_params(
     frame_count: int,
     flow_long_side: int | None = None,
 ) -> StabilizeParams:
-    """Small DA3-inspired heuristic set for DVD post-stabilization."""
+    """Small DA3-inspired heuristic set for depth post-stabilization."""
     long_side = max(process_w, process_h)
     flow_side = flow_long_side or min(long_side, 480)
     # Colab ~12GiB hosts: Farneback at 480 on 600+ frames looks "hung" for many minutes.

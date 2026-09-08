@@ -21,17 +21,15 @@ build/
 
 # Model weights & HF downloads (large)
 ckpt/*
-!ckpt/model_config.yaml
 !ckpt/.gitkeep
 models/
-vendor/DVD/ckpt/*.safetensors
-vendor/DVD/models/
 
 # Outputs
 outputs/
 inference_results/
+demo_output/
 *.mp4
-!vendor/DVD/demo/*.mp4
+!vendor/DepthCrafter/examples/*.mp4
 outputs/.dit_cache*/
 
 # Caches
@@ -43,5 +41,4 @@ tmp/
 temp/
 
 # Nested upstream git metadata (vendored as plain files)
-vendor/DVD/.git.bak.nested/
-vendor/DVD/.git/
+vendor/DepthCrafter/.git/

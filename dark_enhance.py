@@ -1,11 +1,11 @@
-"""Low-cost dark-scene contrast / edge pre-pass for DVD video encoding.
+"""Low-cost dark-scene contrast / edge pre-pass for DepthCrafter video encoding.
 
-Applied only to inference RGB tensors so the VAE still sees silhouettes
+Applied only to inference RGB frames so the model still sees silhouettes
 (heads, limbs) when people walk into shadow. Optical-flow, shot stabilize,
 and JBU keep the original frames.
 
 OpenCV only: CLAHE + optional gamma lift + Scharr overlay + chroma boost.
-Cost is negligible next to DVD inference (infer-resolution uint8, no GPU).
+Cost is negligible next to DepthCrafter inference (infer-resolution uint8).
 """
 
 from __future__ import annotations

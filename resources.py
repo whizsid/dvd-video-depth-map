@@ -1,4 +1,4 @@
-"""Resource governor: size DVD pipeline concurrency from live RAM / CPU / MPS."""
+"""Resource governor: size pipeline concurrency from live RAM / CPU / MPS."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ PRESSURE_TARGET = 0.90
 # Soft-cap system CPU so VAE / JBU leave headroom for the OS + decode threads.
 CPU_SOFT_CAP = 0.95
 
-# How many decoded windows prep may buffer ahead of DVD infer.
+# How many decoded windows prep may buffer ahead of infer (legacy windowed path).
 DEFAULT_PREP_QUEUE_DEPTH = 2
 MAX_PREP_QUEUE_DEPTH = 6
 

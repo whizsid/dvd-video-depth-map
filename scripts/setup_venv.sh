@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Create and populate the project virtualenv (macOS / Apple Silicon).
+# Video DepthCrafter inference is CUDA-only (Colab T4); this venv is for
+# photo/DA3 depth and shared post-process deps.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +19,6 @@ source "$ROOT/.venv/bin/activate"
 
 pip install --upgrade pip setuptools wheel
 pip install -r "$ROOT/requirements.txt"
-pip install -e "$ROOT/vendor/DVD" --no-deps
 
 # DA3: xformers is optional on Mac; install package without pulling it in.
 pip install "git+https://github.com/ByteDance-Seed/Depth-Anything-3.git" --no-deps
@@ -26,6 +27,9 @@ pip install moviepy==1.0.3 e3nn omegaconf typer plyfile trimesh open3d evo pillo
 echo
 echo "Done. Activate with:"
 echo "  source $ROOT/.venv/bin/activate"
+echo
+echo "Photo depth (DA3) works on MPS/CPU."
+echo "Video depth uses DepthCrafter on CUDA — see README / Colab notebook."
 echo
 echo "If you hit OpenMP errors (libomp), run:"
 echo "  export KMP_DUPLICATE_LIB_OK=TRUE"

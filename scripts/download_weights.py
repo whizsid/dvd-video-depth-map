@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download DVD checkpoints from Hugging Face into ./ckpt."""
+"""Download DepthCrafter + SVD-XT weights from Hugging Face into ./ckpt."""
 
 from __future__ import annotations
 
@@ -10,17 +10,24 @@ from huggingface_hub import snapshot_download
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download DVD model weights")
+    parser = argparse.ArgumentParser(
+        description="Download DepthCrafter UNet and SVD-XT backbone weights"
+    )
     parser.add_argument(
-        "--repo",
-        default="FayeHongfeiZhang/DVD",
-        help="Hugging Face repo id",
+        "--unet-repo",
+        default="tencent/DepthCrafter",
+        help="Hugging Face repo id for the DepthCrafter UNet",
+    )
+    parser.add_argument(
+        "--svd-repo",
+        default="stabilityai/stable-video-diffusion-img2vid-xt",
+        help="Hugging Face repo id for the SVD-XT backbone",
     )
     parser.add_argument(
         "--local-dir",
         type=Path,
         default=Path("ckpt"),
-        help="Where to store checkpoints",
+        help="Root directory for checkpoints",
     )
     parser.add_argument(
         "--revision",
@@ -29,15 +36,44 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    args.local_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {args.repo}@{args.revision} -> {args.local_dir.resolve()}")
+    root = args.local_dir
+    root.mkdir(parents=True, exist_ok=True)
+    unet_dir = root / "DepthCrafter"
+    svd_dir = root / "stable-video-diffusion-img2vid-xt"
+
+    print(f"Downloading {args.unet_repo}@{args.revision} -> {unet_dir.resolve()}")
     snapshot_download(
-        repo_id=args.repo,
+        repo_id=args.unet_repo,
         revision=args.revision,
-        local_dir=str(args.local_dir),
+        local_dir=str(unet_dir),
         local_dir_use_symlinks=False,
     )
-    print("Done. Expected files: ckpt/dvd_1.1.safetensors, ckpt/model_config.yaml")
+    print(
+        f"Downloading {args.svd_repo}@{args.revision} -> {svd_dir.resolve()}\n"
+        "  (SVD-XT usually requires a Hugging Face token + license accept)"
+    )
+    snapshot_download(
+        repo_id=args.svd_repo,
+        revision=args.revision,
+        local_dir=str(svd_dir),
+        local_dir_use_symlinks=False,
+        allow_patterns=[
+            "feature_extractor/*",
+            "image_encoder/*",
+            "scheduler/*",
+            "unet/*",
+            "vae/*",
+            "model_index.json",
+            "*.json",
+            "*fp16*",
+            "*.safetensors",
+        ],
+    )
+    print(
+        "Done. Expected:\n"
+        f"  {unet_dir}/ (config.json, diffusion_pytorch_model*.safetensors)\n"
+        f"  {svd_dir}/ (SVD-XT fp16 components)"
+    )
 
 
 if __name__ == "__main__":
