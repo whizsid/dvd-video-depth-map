@@ -1,6 +1,6 @@
-# Shared deps for DepthCrafter video depth (CUDA) and DA3 photo depth.
+# Deps for DepthCrafter video depth (CUDA).
 # CUDA-only packages (xformers) are optional — enabled at runtime if present.
-# Colab provides CUDA torch; Mac venv is primarily for photo/DA3.
+# Colab provides CUDA torch; local installs need a CUDA-capable torch build.
 
 torch>=2.5.0
 torchvision>=0.20.0
@@ -19,8 +19,6 @@ numpy
 Pillow
 tqdm
 psutil>=5.9.0
-rawpy>=0.22.0
-# Photo depth (DA3): pip install git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
 # Optional video decode accel used by upstream DepthCrafter utils (we use OpenCV):
 # decord
 # Optional: xformers (CUDA) for memory-efficient attention

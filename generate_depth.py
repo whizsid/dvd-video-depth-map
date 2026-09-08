@@ -37,7 +37,6 @@ from da3_stabilize import (  # noqa: E402
     normalize_disparity_to_bgr_u8,
     probe_shot_ranges,
 )
-from dark_enhance import DarkEdgePrepass, default_dark_enhance_params  # noqa: E402
 from denoise import (  # noqa: E402
     ParallelDenoiser,
     default_denoise_params,
@@ -257,21 +256,8 @@ def load_infer_frames(
     out_h: int,
     out_w: int,
     total_frames: int,
-    dark_enhance: bool = True,
-    dark_enhance_strength: float = 1.0,
 ) -> np.ndarray:
     """Decode frames to float32 RGB [T,H,W,3] in [0,1] at inference resolution."""
-    enhancer: DarkEdgePrepass | None = None
-    if dark_enhance and float(dark_enhance_strength) > 0.0:
-        enhancer = DarkEdgePrepass(
-            default_dark_enhance_params(strength=float(dark_enhance_strength))
-        )
-        print(
-            f"Dark-scene pre-pass: CLAHE + Scharr edges + sat "
-            f"(strength={float(dark_enhance_strength):.2f}; DepthCrafter input only)",
-            flush=True,
-        )
-
     cap = open_video_capture(video_path)
     frames: list[np.ndarray] = []
     try:
@@ -281,8 +267,6 @@ def load_infer_frames(
                 break
             if bgr.shape[0] != out_h or bgr.shape[1] != out_w:
                 bgr = cv2.resize(bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            if enhancer is not None:
-                bgr = enhancer(bgr)
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             frames.append(np.ascontiguousarray(rgb))
             if (len(frames) % 64 == 0) or len(frames) == total_frames:
@@ -526,20 +510,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip DA3-style shot band-lock + temporal median",
     )
-    parser.add_argument(
-        "--no-dark-enhance",
-        action="store_true",
-        help=(
-            "Skip dark-scene CLAHE / Scharr / saturation pre-pass on "
-            "DepthCrafter input (JBU and stabilize always use original RGB)"
-        ),
-    )
-    parser.add_argument(
-        "--dark-enhance-strength",
-        type=float,
-        default=1.0,
-        help="Dark-scene pre-pass amount (0–2, default 1.0)",
-    )
     return parser.parse_args()
 
 
@@ -570,8 +540,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is required for DepthCrafter video depth. "
-            "Use generate_depth_photo.py for stills on MPS/CPU, "
-            "or enable a CUDA GPU runtime (e.g. Colab T4)."
+            "Enable a CUDA GPU runtime (e.g. Colab T4)."
         )
 
     args = apply_t4_defaults(args)
@@ -614,7 +583,6 @@ def main() -> None:
         f"upsample={'JBU ' + str(args.upsample_device) if do_upsample else 'off'} | "
         f"denoise={args.denoise_device if do_denoise else 'off'} | "
         f"stabilize={'on' if do_stabilize else 'off'} | "
-        f"dark_enhance={'off' if args.no_dark_enhance else f'clahe+edge x{args.dark_enhance_strength:g}'} | "
         f"cache={cache_root}",
         flush=True,
     )
@@ -645,8 +613,6 @@ def main() -> None:
         out_h=out_h,
         out_w=out_w,
         total_frames=total_probe,
-        dark_enhance=not args.no_dark_enhance,
-        dark_enhance_strength=args.dark_enhance_strength,
     )
     total_frames = int(frames.shape[0])
     free_memory(device)
